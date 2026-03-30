@@ -1,0 +1,274 @@
+#==============================================================================
+# Environment & Configuration (SENSITIVE - NEVER COMMIT REAL VALUES)
+#==============================================================================
+
+# Actual environment files with real credentials/API keys (DO NOT COMMIT)
+.env
+.env.local
+.env.*.local
+.env.production
+.env.production.local
+.env.development.local
+backend/.env
+backend/.env.local
+backend/.env.production
+frontend/.env
+frontend/.env.local
+
+# Note: .env.example SHOULD be committed (it's a template with placeholders)
+
+#==============================================================================
+# Frontend Node.js
+#==============================================================================
+
+frontend/node_modules/
+frontend/.pnp
+frontend/.pnp.js
+frontend/dist/
+frontend/dist-ssr/
+frontend/coverage/
+frontend/.nyc_output/
+
+# Frontend Logs
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/lerna-debug.log*
+
+# Frontend Local Environment
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+#==============================================================================
+# Backend Python
+#==============================================================================
+
+backend/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/*.so
+backend/.Python
+backend/build/
+backend/develop-eggs/
+backend/dist/
+backend/downloads/
+backend/eggs/
+backend/.eggs/
+backend/lib/
+backend/lib64/
+backend/parts/
+backend/sdist/
+backend/var/
+backend/wheels/
+backend/pip-wheel-metadata/
+backend/share/python-wheels/
+backend/*.egg-info/
+backend/.installed.cfg
+backend/*.egg
+backend/MANIFEST
+
+# Virtual Environment
+backend/venv/
+backend/ENV/
+backend/env/
+backend/.venv
+backend/venv.bak/
+backend/env.bak/
+
+# Backend Local Environment (Additional variants)
+backend/.env.*.local
+
+# Backend Storage (uploaded files, models, etc.)
+backend/storage/
+backend/uploads/
+backend/models/
+backend/faiss_indices/
+backend/*.db
+backend/*.sqlite
+
+# Backend Logs
+backend/logs/
+backend/*.log
+
+# Backend IDE
+backend/.idea/
+backend/.vscode/
+backend/*.swp
+backend/*.swo
+
+#==============================================================================
+# Root Level Node.js (should all be in frontend/ now)
+#==============================================================================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+#==============================================================================
+# Root Level IDE & Editors
+#==============================================================================
+
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+#==============================================================================
+# OS Files
+#==============================================================================
+
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+#==============================================================================
+# Docker
+#==============================================================================
+
+# Docker volumes (local only)
+.docker/
+docker-volumes/
+
+# Docker build artifacts
+.docker-build/
+
+#==============================================================================
+# Development Tools
+#==============================================================================
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Black formatter
+.black
+
+# isort
+.isort.cfg
+
+#==============================================================================
+# Build Artifacts
+#==============================================================================
+
+dist/
+dist-ssr/
+*.local
+build/
+*.egg-info/
+
+#==============================================================================
+# Temporary Files
+#==============================================================================
+
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+.#*
+
+#==============================================================================
+# Database Files (should be in Docker volumes)
+#==============================================================================
+
+*.db
+*.sqlite
+*.sqlite3
+*.dbf
+
+#==============================================================================
+# Credentials, Keys & Secrets (CRITICAL - NEVER COMMIT)
+#==============================================================================
+
+# Private key files
+*.pem
+*.key
+*.key.pem
+*.crt
+*.cert
+*.p12
+*.pfx
+.keystore
+
+# Credential storage directories
+.aws/
+.credentials
+.ssh/
+secrets/
+.vault/
+creds/
+
+# API Key backup files
+*.apikey
+*.secret
+*.token
+
+# Certificate directories
+certs/
+keys/
+!certs/.gitkeep
+!keys/.gitkeep
+
+#==============================================================================
+# Large Model & Binary Files
+#==============================================================================
+
+backend/*.bin
+backend/*.pt
+backend/*.safetensors
+backend/embeddings_cache/
+*.model
+*.pickle
+*.pkl
+*.joblib
+
+#==============================================================================
+# Database Backups
+#==============================================================================
+
+*.sql
+*.sql.backup
+*.sql.dump
+*.pg_dump
+postgres_data/
+db_backups/
+
+#==============================================================================
+# Keep directories with .gitkeep
+#==============================================================================
+
+!**/.gitkeep
