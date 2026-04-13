@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.services import DashboardService
 from app.models import ResearchPaper, PaperSource, ResearchClaim, SynthesisAnswer, ReasoningStep, MissionTimeline, ClaimTypeEnum
+from app.services.claim_curation import build_mission_findings
+from app.services.synthesis_generation import SynthesisGenerationService
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -223,36 +225,17 @@ async def get_mission_synthesis(
         Current synthesis including answer, findings, uncertainty
     """
     try:
-        stmt = select(SynthesisAnswer).where(SynthesisAnswer.mission_id == mission_id)
-        result = await db.execute(stmt)
-        synthesis = result.scalar_one_or_none()
-        
+        service = SynthesisGenerationService(db)
+        synthesis = await service.get_latest_synthesis(mission_id)
         if not synthesis:
             return {
                 "mission_id": mission_id,
                 "synthesis": None,
                 "message": "No synthesis available yet"
             }
-        
         return {
             "mission_id": mission_id,
-            "synthesis": {
-                "id": str(synthesis.id),
-                "answer_text": synthesis.answer_text,
-                "answer_confidence": float(synthesis.answer_confidence),
-                "key_findings": synthesis.key_findings or [],
-                "uncertainty_statement": synthesis.uncertainty_statement,
-                "limitations": synthesis.limitations or [],
-                "knowledge_gaps": synthesis.knowledge_gaps or [],
-                "supporting_claims_count": synthesis.supporting_claims_count,
-                "contradicting_claims_count": synthesis.contradicting_claims_count,
-                "neutral_claims_count": synthesis.neutral_claims_count,
-                "confidence_at_creation": float(synthesis.confidence_at_creation) if synthesis.confidence_at_creation else None,
-                "confidence_current": float(synthesis.confidence_current) if synthesis.confidence_current else None,
-                "generated_by": synthesis.generated_by,
-                "created_at": synthesis.created_at.isoformat() if synthesis.created_at else None,
-                "updated_at": synthesis.updated_at.isoformat() if synthesis.updated_at else None,
-            }
+            "synthesis": synthesis,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -262,6 +245,7 @@ async def get_mission_synthesis(
 async def get_mission_claims(
     mission_id: str,
     claim_type: str = Query(None),  # supporting, contradicting, neutral, related
+    view: str = Query("findings", pattern="^(findings|raw)$"),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
@@ -285,26 +269,38 @@ async def get_mission_claims(
         
         result = await db.execute(stmt)
         claims = result.scalars().all()
-        
-        claims_data = [
-            {
-                "id": str(claim.id),
-                "claim_text": claim.statement_raw or claim.statement_normalized or "N/A",
-                "claim_type": claim.claim_type.value,
-                "confidence_score": float(claim.composite_confidence),
-                "paper_title": claim.paper_title or "Unknown",
-                "direction": claim.direction.value if claim.direction else "NULL",
-                "validation_status": claim.validation_status.value if claim.validation_status else "UNKNOWN",
-                "extracted_at": claim.extraction_timestamp.isoformat() if claim.extraction_timestamp else None,
+
+        if view == "raw":
+            claims_data = [
+                {
+                    "id": str(claim.id),
+                    "claim_text": claim.statement_raw or claim.statement_normalized or "N/A",
+                    "claim_type": claim.claim_type.value,
+                    "confidence_score": float(claim.composite_confidence),
+                    "paper_title": claim.paper_title or "Unknown",
+                    "direction": claim.direction.value if claim.direction else "NULL",
+                    "validation_status": claim.validation_status.value if claim.validation_status else "UNKNOWN",
+                    "extracted_at": claim.extraction_timestamp.isoformat() if claim.extraction_timestamp else None,
+                    "aggregation_scope": "raw_claim",
+                }
+                for claim in claims
+            ]
+            return {
+                "mission_id": mission_id,
+                "claims": claims_data,
+                "count": len(claims_data),
+                "filter": claim_type or "all",
+                "view": "raw",
             }
-            for claim in claims
-        ]
-        
+
+        findings = build_mission_findings(claims, max_findings=200)
         return {
             "mission_id": mission_id,
-            "claims": claims_data,
-            "count": len(claims_data),
+            "claims": findings,
+            "count": len(findings),
             "filter": claim_type or "all",
+            "view": "findings",
+            "raw_claim_count": len(claims),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

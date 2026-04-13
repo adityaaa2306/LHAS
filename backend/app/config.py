@@ -36,6 +36,7 @@ class Settings:
     # Paper Ingestion API Keys
     SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
     PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "")
+    GROBID_URL = os.getenv("GROBID_URL", "http://localhost:8070")
 
     # NVIDIA NIM Configuration (LLM Provider)
     NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")

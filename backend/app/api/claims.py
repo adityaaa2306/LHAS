@@ -14,10 +14,45 @@ from typing import Optional, List
 from uuid import UUID
 
 from app.database import get_db
-from app.models import ResearchClaim, ResearchPaper
+from app.models import ContradictionRecord, ResearchClaim, ResearchPaper
 from app.models.claims import ClaimTypeEnum, DirectionEnum, ValidationStatusEnum
+from app.services.claim_curation import (
+    build_mission_findings,
+    claim_confidence,
+    claim_direction_value,
+    claim_section,
+    claim_type_value,
+    summarize_findings,
+)
 
 router = APIRouter(prefix="/api/claims", tags=["claims"])
+
+
+async def _load_mission_claims(
+    db: AsyncSession,
+    mission_id: str,
+    claim_type: Optional[str] = None,
+    direction: Optional[str] = None,
+    min_confidence: Optional[float] = None,
+    max_confidence: Optional[float] = None,
+    validation_status: Optional[str] = None,
+) -> List[ResearchClaim]:
+    query = select(ResearchClaim).where(ResearchClaim.mission_id == mission_id)
+
+    if claim_type:
+        query = query.where(ResearchClaim.claim_type == claim_type)
+    if direction:
+        query = query.where(ResearchClaim.direction == direction)
+    if min_confidence is not None:
+        query = query.where(ResearchClaim.composite_confidence >= min_confidence)
+    if max_confidence is not None:
+        query = query.where(ResearchClaim.composite_confidence <= max_confidence)
+    if validation_status:
+        query = query.where(ResearchClaim.validation_status == validation_status)
+
+    query = query.order_by(ResearchClaim.composite_confidence.desc())
+    result = await db.execute(query)
+    return result.scalars().all()
 
 
 @router.get("/mission/{mission_id}", response_model=dict)
@@ -25,6 +60,7 @@ async def list_claims_for_mission(
     mission_id: str,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
+    view: str = Query("findings", pattern="^(findings|raw)$"),
     claim_type: Optional[str] = None,
     direction: Optional[str] = None,
     min_confidence: Optional[float] = Query(None, ge=0.05, le=0.95),
@@ -33,7 +69,7 @@ async def list_claims_for_mission(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
-    List all claims for a mission with optional filtering.
+    List mission findings by default, with optional raw-claim access for debugging.
     
     Query Parameters:
     - skip: Number of results to skip (pagination)
@@ -47,45 +83,67 @@ async def list_claims_for_mission(
     Returns: { total, claims, has_more, confidence_stats }
     """
     try:
-        # Build query
-        query = select(ResearchClaim).where(ResearchClaim.mission_id == mission_id)
-        
-        # Apply filters
-        if claim_type:
-            query = query.where(ResearchClaim.claim_type == claim_type)
-        if direction:
-            query = query.where(ResearchClaim.direction == direction)
-        if min_confidence:
-            query = query.where(ResearchClaim.composite_confidence >= min_confidence)
-        if max_confidence:
-            query = query.where(ResearchClaim.composite_confidence <= max_confidence)
-        if validation_status:
-            query = query.where(ResearchClaim.validation_status == validation_status)
-        
-        # Get total count
-        count_query = select(func.count(ResearchClaim.id)).where(
-            ResearchClaim.mission_id == mission_id
+        claims = await _load_mission_claims(
+            db=db,
+            mission_id=mission_id,
+            claim_type=claim_type,
+            direction=direction,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+            validation_status=validation_status,
         )
-        total_result = await db.execute(count_query)
-        total = total_result.scalar()
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute query
-        result = await db.execute(query)
-        claims = result.scalars().all()
-        
-        # Format response
+
+        if view == "raw":
+            total = len(claims)
+            page = claims[skip:skip + limit]
+            return {
+                "view": "raw",
+                "total": total,
+                "claims": [_format_claim(c) for c in page],
+                "has_more": (skip + len(page)) < total,
+                "skip": skip,
+                "limit": limit,
+            }
+
+        findings = build_mission_findings(claims, max_findings=200)
+        total = len(findings)
+        page = findings[skip:skip + limit]
         return {
+            "view": "findings",
             "total": total,
-            "claims": [_format_claim(c) for c in claims],
-            "has_more": (skip + len(claims)) < total,
+            "claims": page,
+            "has_more": (skip + len(page)) < total,
             "skip": skip,
-            "limit": limit
+            "limit": limit,
+            "raw_claim_count": len(claims),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve claims: {str(e)}")
+
+
+@router.get("/mission/{mission_id}/findings", response_model=dict)
+async def list_findings_for_mission(
+    mission_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(30, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        claims = await _load_mission_claims(db=db, mission_id=mission_id)
+        findings = build_mission_findings(claims, max_findings=200)
+        page = findings[skip:skip + limit]
+        return {
+            "mission_id": mission_id,
+            "view": "findings",
+            "total": len(findings),
+            "findings": page,
+            "has_more": (skip + len(page)) < len(findings),
+            "skip": skip,
+            "limit": limit,
+            "raw_claim_count": len(claims),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve mission findings: {str(e)}")
 
 
 @router.get("/{claim_id}", response_model=dict)
@@ -120,6 +178,7 @@ async def get_claim(
 @router.get("/mission/{mission_id}/stats", response_model=dict)
 async def get_claim_statistics(
     mission_id: str,
+    view: str = Query("findings", pattern="^(findings|raw)$"),
     db: AsyncSession = Depends(get_db)
 ) -> dict:
     """
@@ -137,106 +196,86 @@ async def get_claim_statistics(
     - normalization_quality: % of claims with canonical entities
     """
     try:
-        # Total counts
-        total_result = await db.execute(
-            select(func.count(ResearchClaim.id)).where(
-                ResearchClaim.mission_id == mission_id
-            )
-        )
-        total = total_result.scalar() or 0
-        
-        if total == 0:
+        claims = await _load_mission_claims(db=db, mission_id=mission_id)
+        raw_total = len(claims)
+
+        if raw_total == 0:
             return {
                 "total_claims": 0,
                 "message": "No claims extracted for this mission"
             }
-        
-        # By validation status
-        valid_result = await db.execute(
-            select(func.count(ResearchClaim.id)).where(
-                and_(
-                    ResearchClaim.mission_id == mission_id,
-                    ResearchClaim.validation_status == ValidationStatusEnum.VALID.value
-                )
-            )
-        )
-        valid = valid_result.scalar() or 0
-        
-        degraded_result = await db.execute(
-            select(func.count(ResearchClaim.id)).where(
-                and_(
-                    ResearchClaim.mission_id == mission_id,
-                    ResearchClaim.validation_status == ValidationStatusEnum.EXTRACTION_DEGRADED.value
-                )
-            )
-        )
-        degraded = degraded_result.scalar() or 0
-        
-        # By claim type
-        type_result = await db.execute(
-            select(ResearchClaim.claim_type, func.count(ResearchClaim.id)).where(
-                ResearchClaim.mission_id == mission_id
-            ).group_by(ResearchClaim.claim_type)
-        )
-        by_type = {str(row[0]): row[1] for row in type_result.all() if row[0]}
-        
-        # By direction
-        direction_result = await db.execute(
-            select(ResearchClaim.direction, func.count(ResearchClaim.id)).where(
-                ResearchClaim.mission_id == mission_id
-            ).group_by(ResearchClaim.direction)
-        )
-        by_direction = {str(row[0]): row[1] for row in direction_result.all()}
-        
-        # Get all confidence values for distribution
-        confidence_result = await db.execute(
-            select(ResearchClaim.composite_confidence).where(
-                ResearchClaim.mission_id == mission_id
-            )
-        )
-        confidences = [row[0] for row in confidence_result.all()]
-        
-        # Calculate statistics
-        if confidences:
-            avg_confidence = sum(confidences) / len(confidences)
-            sorted_conf = sorted(confidences)
-            p25_idx = len(sorted_conf) // 4
-            p50_idx = len(sorted_conf) // 2
-            p75_idx = (3 * len(sorted_conf)) // 4
-            
-            confidence_stats = {
-                "mean": round(avg_confidence, 3),
-                "min": round(min(confidences), 3),
-                "max": round(max(confidences), 3),
-                "p25": round(sorted_conf[p25_idx], 3),
-                "median": round(sorted_conf[p50_idx], 3),
-                "p75": round(sorted_conf[p75_idx], 3),
+
+        if view == "findings":
+            findings = build_mission_findings(claims, max_findings=200)
+            summary = summarize_findings(findings)
+            return {
+                "view": "findings",
+                "total_claims": summary["total_findings"],
+                "valid_claims": summary["valid_findings"],
+                "degraded_claims": 0,
+                "percentage_valid": summary["percentage_valid"],
+                "by_type": summary["by_type"],
+                "by_direction": summary["by_direction"],
+                "by_section": summary["by_section"],
+                "confidence_statistics": summary["confidence_statistics"],
+                "normalization_quality_percentage": round(
+                    (
+                        sum(
+                            1
+                            for finding in findings
+                            if finding.get("intervention_canonical") and finding.get("outcome_canonical")
+                        ) / len(findings) * 100
+                    ) if findings else 0.0,
+                    1,
+                ),
+                "raw_claim_count": raw_total,
             }
-        else:
-            confidence_stats = {}
-        
-        # Normalization quality
-        canonical_result = await db.execute(
-            select(func.count(ResearchClaim.id)).where(
-                and_(
-                    ResearchClaim.mission_id == mission_id,
-                    ResearchClaim.intervention_canonical.isnot(None),
-                    ResearchClaim.outcome_canonical.isnot(None)
-                )
-            )
+
+        valid = sum(
+            1 for claim in claims
+            if getattr(claim.validation_status, "value", claim.validation_status) == ValidationStatusEnum.VALID.value
         )
-        canonical_count = canonical_result.scalar() or 0
-        normalization_quality = (canonical_count / total * 100) if total > 0 else 0
-        
+        degraded = sum(
+            1 for claim in claims
+            if getattr(claim.validation_status, "value", claim.validation_status) == ValidationStatusEnum.EXTRACTION_DEGRADED.value
+        )
+        by_type = {}
+        by_direction = {}
+        by_section = {}
+        confidences = []
+        canonical_count = 0
+        for claim in claims:
+            by_type[claim_type_value(claim)] = by_type.get(claim_type_value(claim), 0) + 1
+            by_direction[claim_direction_value(claim)] = by_direction.get(claim_direction_value(claim), 0) + 1
+            by_section[claim_section(claim)] = by_section.get(claim_section(claim), 0) + 1
+            confidences.append(claim_confidence(claim))
+            if claim.intervention_canonical and claim.outcome_canonical:
+                canonical_count += 1
+
+        sorted_conf = sorted(confidences)
+        p25_idx = len(sorted_conf) // 4
+        p50_idx = len(sorted_conf) // 2
+        p75_idx = (3 * len(sorted_conf)) // 4
+        confidence_stats = {
+            "mean": round(sum(confidences) / len(confidences), 3),
+            "min": round(min(confidences), 3),
+            "max": round(max(confidences), 3),
+            "p25": round(sorted_conf[p25_idx], 3),
+            "median": round(sorted_conf[p50_idx], 3),
+            "p75": round(sorted_conf[p75_idx], 3),
+        }
+
         return {
-            "total_claims": total,
+            "view": "raw",
+            "total_claims": raw_total,
             "valid_claims": valid,
             "degraded_claims": degraded,
-            "percentage_valid": round(valid / total * 100, 1) if total > 0 else 0,
+            "percentage_valid": round(valid / raw_total * 100, 1) if raw_total > 0 else 0,
             "by_type": by_type,
             "by_direction": by_direction,
+            "by_section": by_section,
             "confidence_statistics": confidence_stats,
-            "normalization_quality_percentage": round(normalization_quality, 1),
+            "normalization_quality_percentage": round((canonical_count / raw_total) * 100, 1) if raw_total > 0 else 0,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to compute statistics: {str(e)}")
@@ -311,13 +350,24 @@ async def get_mission_clusters(
                 clusters_dict[key] = []
             clusters_dict[key].append(claim)
         
+        contradiction_rows = (
+            await db.execute(
+                select(ContradictionRecord).where(ContradictionRecord.mission_id == mission_id)
+            )
+        ).scalars().all()
+        contradiction_map = {}
+        for row in contradiction_rows:
+            key = (row.intervention_canonical or "", row.outcome_canonical or "")
+            contradiction_map.setdefault(key, []).append(row)
+
         # Build cluster responses
         clusters = []
         for (intervention_canonical, outcome_canonical), claims in clusters_dict.items():
             cluster = _build_evidence_cluster(
                 intervention_canonical,
                 outcome_canonical,
-                claims
+                claims,
+                contradiction_map.get((intervention_canonical or "", outcome_canonical or ""), []),
             )
             clusters.append(cluster)
         
@@ -358,7 +408,8 @@ async def get_mission_clusters(
 def _build_evidence_cluster(
     intervention_canonical: str,
     outcome_canonical: str,
-    claims: List[ResearchClaim]
+    claims: List[ResearchClaim],
+    contradiction_records: List[ContradictionRecord],
 ) -> dict:
     """Build a single evidence cluster from grouped claims."""
     
@@ -374,7 +425,9 @@ def _build_evidence_cluster(
     contradictions = []
     
     for claim in claims:
-        direction_str = str(claim.direction).lower()
+        direction_str = claim_direction_value(claim)
+        if direction_str not in direction_counts:
+            direction_str = "unclear"
         direction_counts[direction_str] += 1
         confidence_scores.append(claim.composite_confidence)
     
@@ -385,29 +438,27 @@ def _build_evidence_cluster(
         else 0.0
     )
     
-    # Detect contradictions (positive vs negative)
-    has_positive = direction_counts['positive'] > 0
-    has_negative = direction_counts['negative'] > 0
-    contradiction_severity = 'HIGH' if (has_positive and has_negative) else 'NONE'
-    
-    if has_positive and has_negative:
-        contradiction_pairs = []
-        positive_claims = [c for c in claims if str(c.direction).lower() == 'positive']
-        negative_claims = [c for c in claims if str(c.direction).lower() == 'negative']
-        
-        # Build contradiction pairs (limit to first 3 pairs)
-        for pos_claim in positive_claims[:2]:
-            for neg_claim in negative_claims[:2]:
-                if len(contradiction_pairs) < 3:
-                    contradiction_pairs.append({
-                        "claim1_id": str(pos_claim.id),
-                        "claim1_direction": "positive",
-                        "claim1_paper": pos_claim.paper_title or "Unknown",
-                        "claim2_id": str(neg_claim.id),
-                        "claim2_direction": "negative",
-                        "claim2_paper": neg_claim.paper_title or "Unknown",
-                    })
-        contradictions = contradiction_pairs
+    contradiction_severity = "NONE"
+    if contradiction_records:
+        severity_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        contradiction_severity = max(
+            (getattr(row.severity, "value", row.severity) for row in contradiction_records),
+            key=lambda item: severity_order.get(str(item), 0),
+            default="LOW",
+        )
+        claim_lookup = {str(claim.id): claim for claim in claims}
+        for row in contradiction_records[:3]:
+            claim_a = claim_lookup.get(str(row.claim_a_id))
+            claim_b = claim_lookup.get(str(row.claim_b_id))
+            contradictions.append({
+                "claim1_id": str(row.claim_a_id),
+                "claim1_direction": row.direction_a,
+                "claim1_paper": (claim_a.paper_title if claim_a else "Unknown"),
+                "claim2_id": str(row.claim_b_id),
+                "claim2_direction": row.direction_b,
+                "claim2_paper": (claim_b.paper_title if claim_b else "Unknown"),
+                "severity": getattr(row.severity, "value", row.severity),
+            })
     
     return {
         "cluster_key": {
@@ -430,7 +481,7 @@ def _build_evidence_cluster(
             "null": direction_counts['null'] + direction_counts['unclear'],
         },
         "contradiction_signal": {
-            "has_conflict": contradiction_severity != 'NONE',
+            "has_conflict": bool(contradiction_records),
             "severity": contradiction_severity,
             "pairs": contradictions[:3],  # Top 3 contradictions
         },
@@ -440,10 +491,10 @@ def _build_evidence_cluster(
             {
                 "id": str(claim.id),
                 "statement": claim.statement_raw,
-                "direction": str(claim.direction).lower(),
+                "direction": claim_direction_value(claim),
                 "confidence": round(claim.composite_confidence, 3),
                 "paper_title": claim.paper_title or "Unknown",
-                "claim_type": str(claim.claim_type),
+                "claim_type": claim_type_value(claim),
             }
             for claim in claims
         ]
@@ -457,7 +508,7 @@ def _get_best_evidence_type(claims: List[ResearchClaim]) -> str:
     
     type_scores = {}
     for claim in claims:
-        claim_type = str(claim.claim_type).lower()
+        claim_type = claim_type_value(claim)
         if claim_type not in type_scores:
             type_scores[claim_type] = []
         type_scores[claim_type].append(claim.composite_confidence)
@@ -506,7 +557,7 @@ def _extract_evidence_gaps(
         })
     
     # Gap 4: Contradictory evidence
-    directions = set(str(c.direction).lower() for c in claims)
+    directions = set(claim_direction_value(c) for c in claims)
     if len(directions) > 1 and 'positive' in directions and 'negative' in directions:
         gaps.append({
             "type": "conflicting_evidence",

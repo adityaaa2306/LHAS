@@ -1,7 +1,18 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from typing import List, Dict, Any
-from app.models import Mission, Alert, MissionStatus, HealthStatus, AlertSeverity, IntentType, QueryAnalysis
+from app.models import (
+    Mission,
+    Alert,
+    MissionStatus,
+    HealthStatus,
+    AlertSeverity,
+    IntentType,
+    QueryAnalysis,
+    ResearchPaper,
+    ResearchClaim,
+    MonitoringAlertRecord,
+)
 from datetime import datetime
 from uuid import UUID
 import uuid
@@ -145,6 +156,19 @@ class DashboardService:
         if not mission:
             return None
 
+        live_papers = await self.db.scalar(
+            select(func.count(ResearchPaper.id)).where(ResearchPaper.mission_id == mission_id)
+        ) or 0
+        live_claims = await self.db.scalar(
+            select(func.count(ResearchClaim.id)).where(ResearchClaim.mission_id == mission_id)
+        ) or 0
+        live_alerts = await self.db.scalar(
+            select(func.count(MonitoringAlertRecord.id)).where(
+                MonitoringAlertRecord.mission_id == mission_id,
+                MonitoringAlertRecord.lifecycle_status.in_(["firing", "active"]),
+            )
+        ) or 0
+
         return {
             "id": mission.id,
             "name": mission.name,
@@ -162,12 +186,12 @@ class DashboardService:
             "key_concepts": mission.key_concepts.split(",") if mission.key_concepts else [],
             "ambiguity_flags": mission.ambiguity_flags.split(",") if mission.ambiguity_flags else [],
             "last_run": mission.last_run.isoformat() if mission.last_run else None,
-            "papers": mission.total_papers,
-            "claims": mission.total_claims,
+            "papers": int(live_papers),
+            "claims": int(live_claims),
             "confidence": round(mission.confidence_score, 2),
             "confidence_initial": round(mission.confidence_from_module1, 2) if mission.confidence_from_module1 else None,
             "sessions": mission.session_count,
-            "active_alerts": mission.active_alerts,
+            "active_alerts": int(live_alerts),
             "created_at": mission.created_at.isoformat() if mission.created_at else None,
             "updated_at": mission.updated_at.isoformat() if mission.updated_at else None,
         }

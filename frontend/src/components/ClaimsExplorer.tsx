@@ -1,31 +1,21 @@
-/**
- * Extracted Claims Card - MODULE 3 CLAIM EXTRACTION
- * REDESIGNED: Evidence Clusters Network View
- * 
- * Primary unit: Evidence clusters (not individual claims)
- * A cluster = group of claims from multiple papers with same intervention/outcome pair
- */
-
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
+  AlertTriangle,
+  BarChart3,
   ChevronDown,
   ChevronUp,
-  AlertTriangle,
-  Activity,
-  BarChart3,
   FileText,
-  Zap,
-  TrendingUp,
-  TrendingDown,
   Minus,
   Search,
+  TrendingDown,
+  TrendingUp,
+  Zap,
 } from 'lucide-react';
+
 import { apiClient } from '../services/api';
-import type {
-  EvidenceCluster,
-  ClusterResponse,
-  ClaimSummary,
-} from '../types';
+import { ScrollFadePanel } from './ScrollFadePanel';
+import type { ClaimSummary, ClusterResponse, EvidenceCluster } from '../types';
 
 type ViewMode = 'clusters' | 'conflicts' | 'entities';
 type SortBy = 'confidence' | 'evidence_count' | 'conflicts';
@@ -34,22 +24,17 @@ interface ClaimsExplorerProps {
   missionId: string;
 }
 
-/**
- * MAIN COMPONENT: Extracted Claims Card
- * Container structure remains unchanged (per user requirement)
- */
 export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => {
   const [clusters, setClusters] = useState<EvidenceCluster[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
   const [viewMode, setViewMode] = useState<ViewMode>('clusters');
   const [sortBy, setSortBy] = useState<SortBy>('confidence');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedClusterId, setExpandedClusterId] = useState<string | null>(null);
 
   useEffect(() => {
-    loadClusters();
+    void loadClusters();
   }, [missionId]);
 
   const loadClusters = async () => {
@@ -66,53 +51,49 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
     }
   };
 
-  const getFilteredClusters = (): EvidenceCluster[] => {
-    let filtered = clusters;
+  const filteredClusters = useMemo(() => {
+    let filtered = [...clusters];
 
-    // Filter by view mode
     if (viewMode === 'conflicts') {
-      filtered = filtered.filter((c) => c.contradiction_signal.has_conflict);
+      filtered = filtered.filter((cluster) => cluster.contradiction_signal.has_conflict);
     }
 
-    // Filter by search query
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase();
       filtered = filtered.filter(
-        (c) =>
-          c.cluster_key.intervention_canonical.toLowerCase().includes(query) ||
-          c.cluster_key.outcome_canonical.toLowerCase().includes(query)
+        (cluster) =>
+          cluster.cluster_key.intervention_canonical.toLowerCase().includes(query) ||
+          cluster.cluster_key.outcome_canonical.toLowerCase().includes(query)
       );
     }
 
-    // Sort
     switch (sortBy) {
       case 'confidence':
-        filtered.sort((a, b) => b.statistics.avg_confidence - a.statistics.avg_confidence);
+        filtered.sort((left, right) => right.statistics.avg_confidence - left.statistics.avg_confidence);
         break;
       case 'evidence_count':
-        filtered.sort((a, b) => b.claim_count - a.claim_count);
+        filtered.sort((left, right) => right.claim_count - left.claim_count);
         break;
       case 'conflicts':
-        filtered.sort((a, b) => {
-          const aHasConflict = a.contradiction_signal.has_conflict ? 1 : 0;
-          const bHasConflict = b.contradiction_signal.has_conflict ? 1 : 0;
-          return bHasConflict - aHasConflict;
+        filtered.sort((left, right) => {
+          const leftConflict = left.contradiction_signal.has_conflict ? 1 : 0;
+          const rightConflict = right.contradiction_signal.has_conflict ? 1 : 0;
+          if (rightConflict !== leftConflict) return rightConflict - leftConflict;
+          return right.statistics.avg_confidence - left.statistics.avg_confidence;
         });
         break;
     }
 
     return filtered;
-  };
-
-  const filteredClusters = getFilteredClusters();
+  }, [clusters, searchQuery, sortBy, viewMode]);
 
   if (loading) {
     return (
-      <div className="bg-white rounded-lg shadow p-6">
-        <div className="flex items-center justify-center h-64">
+      <div className="rounded-[20px] border border-neutral-200/80 bg-white p-6 shadow-[0_18px_50px_rgba(15,23,42,0.06)]">
+        <div className="flex h-64 items-center justify-center">
           <div className="text-center">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-            <p className="text-gray-600">Loading evidence clusters...</p>
+            <div className="mx-auto mb-4 h-12 w-12 animate-spin rounded-full border-b-2 border-blue-600" />
+            <p className="text-sm font-medium text-neutral-600">Loading evidence clusters...</p>
           </div>
         </div>
       </div>
@@ -120,8 +101,7 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
   }
 
   return (
-    <div className="bg-white rounded-lg shadow">
-      {/* HEADER with View Toggles */}
+    <div className="overflow-hidden rounded-[20px] border border-neutral-200/80 bg-white shadow-[0_18px_50px_rgba(15,23,42,0.06)]">
       <CardHeader
         viewMode={viewMode}
         onViewModeChange={setViewMode}
@@ -133,17 +113,16 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
         totalClaimsInViewMode={filteredClusters.length}
       />
 
-      {/* ERROR STATE */}
       {error && (
-        <div className="border-b border-gray-200 bg-red-50 p-4">
+        <div className="border-b border-red-100 bg-red-50/80 px-6 py-4">
           <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+            <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-600" />
             <div>
-              <p className="text-sm font-medium text-red-900">Error loading clusters</p>
-              <p className="text-sm text-red-700 mt-1">{error}</p>
+              <p className="text-sm font-semibold text-red-900">Error loading clusters</p>
+              <p className="mt-1 text-sm text-red-700">{error}</p>
               <button
                 onClick={loadClusters}
-                className="mt-2 text-sm font-medium text-red-600 hover:text-red-800 underline"
+                className="mt-2 text-sm font-medium text-red-700 underline underline-offset-2 hover:text-red-900"
               >
                 Retry
               </button>
@@ -152,35 +131,28 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
         </div>
       )}
 
-      {/* CONTENT BASED ON VIEW MODE */}
-      <div className="border-b border-gray-200">
-        {viewMode === 'clusters' && (
-          <ClustersView
-            clusters={filteredClusters}
-            expandedClusterId={expandedClusterId}
-            onExpandChange={setExpandedClusterId}
-          />
-        )}
+      <div className="bg-neutral-50/70 px-4 py-4">
+        <ScrollFadePanel
+          heightClassName="h-[34rem]"
+          className="rounded-[18px] border border-neutral-200/80 bg-neutral-50/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]"
+          contentClassName="px-3 py-3"
+        >
+          {viewMode === 'clusters' && (
+            <ClustersView
+              clusters={filteredClusters}
+              expandedClusterId={expandedClusterId}
+              onExpandChange={setExpandedClusterId}
+            />
+          )}
 
-        {viewMode === 'conflicts' && (
-          <ConflictsView
-            clusters={filteredClusters}
-            expandedClusterId={expandedClusterId}
-            onExpandChange={setExpandedClusterId}
-          />
-        )}
-
-        {viewMode === 'entities' && (
-          <EntitiesView clusters={clusters} />
-        )}
+          {viewMode === 'conflicts' && <ConflictsView clusters={filteredClusters} />}
+          {viewMode === 'entities' && <EntitiesView clusters={clusters} />}
+        </ScrollFadePanel>
       </div>
     </div>
   );
 };
 
-/**
- * CARD HEADER: View toggles, sort, search
- */
 interface CardHeaderProps {
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
@@ -209,68 +181,81 @@ const CardHeader: React.FC<CardHeaderProps> = ({
   ];
 
   return (
-    <div className="border-b border-gray-200 p-6">
-      {/* Title Row */}
-      <div className="flex items-center gap-3 mb-4">
-        <FileText className="w-6 h-6 text-blue-600" />
-        <h3 className="text-xl font-semibold text-gray-900">Extracted Claims</h3>
-        <span className="text-sm text-gray-500 ml-auto">
-          {viewMode === 'conflicts'
-            ? `${totalClaimsInViewMode} clusters with conflicts`
-            : `${totalClaimsInViewMode} clusters (${totalClusters} total)`}
-        </span>
-      </div>
+    <div className="border-b border-neutral-200 bg-gradient-to-b from-white to-neutral-50/70 px-6 py-6">
+      <div className="flex flex-col gap-5">
+        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div className="flex items-start gap-3">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-600 shadow-sm ring-1 ring-blue-100">
+              <FileText className="h-6 w-6" />
+            </div>
+            <div>
+              <h3 className="text-[1.35rem] font-semibold tracking-[-0.02em] text-neutral-950">Extracted Claims</h3>
+              <p className="mt-1 text-sm text-neutral-600">
+                Structured evidence clusters grouped by intervention and outcome, tuned for fast scanning.
+              </p>
+            </div>
+          </div>
 
-      {/* View Mode Toggles */}
-      <div className="flex gap-2 mb-4">
-        {viewModes.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            onClick={() => onViewModeChange(id as ViewMode)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition ${
-              viewMode === id
-                ? 'bg-blue-600 text-white shadow-lg'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-            }`}
-          >
-            <Icon className="w-4 h-4" />
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {/* Search and Sort Row */}
-      <div className="flex gap-4">
-        {/* Search */}
-        <div className="flex-1 relative">
-          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-          <input
-            type="text"
-            placeholder="Search interventions or outcomes..."
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="w-full px-10 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
-          />
+          <div className="rounded-2xl border border-neutral-200 bg-white/80 px-4 py-3 shadow-sm">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Showing</div>
+            <div className="mt-1 text-sm font-medium text-neutral-900">
+              {viewMode === 'conflicts'
+                ? `${totalClaimsInViewMode} conflict clusters`
+                : `${totalClaimsInViewMode} clusters`}
+            </div>
+            <div className="mt-0.5 text-xs text-neutral-500">{totalClusters} total in mission</div>
+          </div>
         </div>
 
-        {/* Sort Dropdown */}
-        <select
-          value={sortBy}
-          onChange={(e) => onSortChange(e.target.value as SortBy)}
-          className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm font-medium"
-        >
-          <option value="confidence">Sort: Confidence ↓</option>
-          <option value="evidence_count">Sort: Evidence Count ↓</option>
-          <option value="conflicts">Sort: Conflicts First</option>
-        </select>
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="inline-flex w-full rounded-2xl border border-neutral-200 bg-white p-1 shadow-sm xl:w-auto">
+            {viewModes.map(({ id, label, icon: Icon }) => {
+              const active = viewMode === id;
+              return (
+                <button
+                  key={id}
+                  onClick={() => onViewModeChange(id as ViewMode)}
+                  className={`inline-flex flex-1 items-center justify-center gap-2 rounded-[14px] px-4 py-2.5 text-sm font-medium transition xl:flex-none ${
+                    active
+                      ? 'bg-neutral-950 text-white shadow-[0_10px_20px_rgba(15,23,42,0.18)]'
+                      : 'text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900'
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px] xl:min-w-[34rem]">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-400" />
+              <input
+                type="text"
+                placeholder="Search interventions or outcomes..."
+                value={searchQuery}
+                onChange={(event) => onSearchChange(event.target.value)}
+                className="h-12 w-full rounded-2xl border border-neutral-200 bg-white pl-11 pr-4 text-sm text-neutral-900 shadow-sm outline-none transition placeholder:text-neutral-400 focus:border-blue-300 focus:ring-4 focus:ring-blue-100"
+              />
+            </div>
+
+            <select
+              value={sortBy}
+              onChange={(event) => onSortChange(event.target.value as SortBy)}
+              className="h-12 rounded-2xl border border-neutral-200 bg-white px-4 text-sm font-medium text-neutral-800 shadow-sm outline-none transition focus:border-blue-300 focus:ring-4 focus:ring-blue-100"
+            >
+              <option value="confidence">Sort: Confidence</option>
+              <option value="evidence_count">Sort: Evidence Count</option>
+              <option value="conflicts">Sort: Conflicts First</option>
+            </select>
+          </div>
+        </div>
       </div>
     </div>
   );
 };
 
-/**
- * CLUSTERS VIEW: Main evidence clusters display
- */
 interface ClustersViewProps {
   clusters: EvidenceCluster[];
   expandedClusterId: string | null;
@@ -283,38 +268,23 @@ const ClustersView: React.FC<ClustersViewProps> = ({
   onExpandChange,
 }) => {
   if (clusters.length === 0) {
-    return (
-      <div className="p-12 text-center">
-        <BarChart3 className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-        <p className="text-gray-600 font-medium mb-1">No evidence clusters</p>
-        <p className="text-gray-500 text-sm">
-          Start by extracting claims from papers to see evidence clusters
-        </p>
-      </div>
-    );
+    return <EmptyState icon={BarChart3} title="No evidence clusters" description="Start by extracting claims from papers to see clustered evidence." />;
   }
 
   return (
-    <div>
+    <div className="space-y-3 pb-8">
+      <LegendRow />
       {clusters.map((cluster, idx) => {
         const clusterId = `${cluster.cluster_key.intervention_canonical}-${cluster.cluster_key.outcome_canonical}-${idx}`;
         const isExpanded = expandedClusterId === clusterId;
 
         return (
-          <div key={clusterId} className="border-b border-gray-100 last:border-0">
-            {/* Cluster Row */}
-            <ClusterRow
-              cluster={cluster}
-              isExpanded={isExpanded}
-              onToggleExpand={() =>
-                onExpandChange(isExpanded ? null : clusterId)
-              }
-            />
-
-            {/* Expanded Details */}
-            {isExpanded && (
-              <ExpandedClusterDetail cluster={cluster} />
-            )}
+          <div
+            key={clusterId}
+            className="overflow-hidden rounded-[18px] border border-neutral-200/90 bg-white shadow-[0_10px_24px_rgba(15,23,42,0.045)] transition hover:-translate-y-[1px] hover:shadow-[0_16px_32px_rgba(15,23,42,0.07)]"
+          >
+            <ClusterRow cluster={cluster} isExpanded={isExpanded} onToggleExpand={() => onExpandChange(isExpanded ? null : clusterId)} />
+            {isExpanded && <ExpandedClusterDetail cluster={cluster} />}
           </div>
         );
       })}
@@ -322,341 +292,350 @@ const ClustersView: React.FC<ClustersViewProps> = ({
   );
 };
 
-/**
- * CLUSTER ROW: Individual cluster summary row
- */
 interface ClusterRowProps {
   cluster: EvidenceCluster;
   isExpanded: boolean;
   onToggleExpand: () => void;
 }
 
-const ClusterRow: React.FC<ClusterRowProps> = ({
-  cluster,
-  isExpanded,
-  onToggleExpand,
-}) => {
-  const confidenceColor =
-    cluster.statistics.avg_confidence >= 0.7
-      ? 'text-green-600'
-      : cluster.statistics.avg_confidence >= 0.5
-      ? 'text-blue-600'
-      : cluster.statistics.avg_confidence >= 0.3
-      ? 'text-yellow-600'
-      : 'text-red-600';
-
-  const confidencePercent = (cluster.statistics.avg_confidence * 100).toFixed(0);
-
+const ClusterRow: React.FC<ClusterRowProps> = ({ cluster, isExpanded, onToggleExpand }) => {
   return (
-    <button
-      onClick={onToggleExpand}
-      className="w-full text-left hover:bg-gray-50 transition p-4"
-    >
-      <div className="flex items-center gap-4">
-        {/* Expand Icon */}
-        <div className="w-6 h-6 flex-shrink-0">
-          {isExpanded ? (
-            <ChevronUp className="w-6 h-6 text-gray-400" />
-          ) : (
-            <ChevronDown className="w-6 h-6 text-gray-400" />
+    <button onClick={onToggleExpand} className="w-full text-left">
+      <div className="grid gap-4 px-5 py-5 md:grid-cols-2 2xl:grid-cols-[minmax(22rem,2.5fr)_minmax(11rem,1fr)_minmax(16rem,1.3fr)_minmax(8rem,0.8fr)_minmax(9rem,0.8fr)] 2xl:items-center">
+        <div className="min-w-0 md:col-span-2 2xl:col-span-1">
+          <div className="flex items-start gap-3">
+            <div className="mt-1 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-neutral-200 bg-neutral-50 text-neutral-500">
+              {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <EvidenceTypeBadge type={cluster.best_evidence_type} />
+                {cluster.contradiction_signal.has_conflict && (
+                  <StatusBadge tone="conflict" label={`${cluster.contradiction_signal.severity} conflict`} />
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-start gap-2 text-base font-semibold leading-7 text-neutral-950">
+                <span className="min-w-0 flex-1 whitespace-normal break-words" title={cluster.cluster_key.intervention_canonical}>
+                  {cluster.cluster_key.intervention_canonical}
+                </span>
+                <span className="mt-[1px] text-neutral-300">→</span>
+                <span className="min-w-0 flex-1 whitespace-normal break-words" title={cluster.cluster_key.outcome_canonical}>
+                  {cluster.cluster_key.outcome_canonical}
+                </span>
+              </div>
+
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-neutral-500">
+                <span>{cluster.claim_count} supporting records</span>
+                <span className="text-neutral-300">•</span>
+                <span>{cluster.claims_summary.length} extracted claims</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 md:justify-start">
+          <MetaPill label="Claims" value={cluster.claim_count} />
+          <MetaPill
+            label="Range"
+            value={`${Math.round(cluster.statistics.min_confidence * 100)}–${Math.round(cluster.statistics.max_confidence * 100)}%`}
+          />
+        </div>
+
+        <div className="md:col-span-2 2xl:col-span-1">
+          <EvidenceDistribution
+            supporting={cluster.evidence_bar.supporting}
+            contradicting={cluster.evidence_bar.contradicting}
+            neutral={cluster.evidence_bar.null}
+          />
+        </div>
+
+        <div className="md:justify-self-start 2xl:justify-self-center">
+          <ConfidenceBadge confidence={cluster.statistics.avg_confidence} />
+        </div>
+
+        <div className="flex items-center justify-start gap-2 2xl:justify-end">
+          {cluster.evidence_gaps.length > 0 && (
+            <StatusBadge tone="warning" label={`${cluster.evidence_gaps.length} gap${cluster.evidence_gaps.length > 1 ? 's' : ''}`} />
           )}
+          <StatusBadge tone="neutral" label={isExpanded ? 'Collapse' : 'Details'} />
         </div>
-
-        {/* Intervention → Outcome */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 text-sm font-medium text-gray-900 truncate">
-            <span className="truncate">{cluster.cluster_key.intervention_canonical}</span>
-            <TrendingUp className="w-4 h-4 text-gray-400 flex-shrink-0" />
-            <span className="truncate">{cluster.cluster_key.outcome_canonical}</span>
-          </div>
-        </div>
-
-        {/* Claim Count */}
-        <div className="px-3 py-1 bg-gray-100 rounded text-xs font-medium text-gray-700 flex-shrink-0">
-          {cluster.claim_count} claims
-        </div>
-
-        {/* Evidence Bar */}
-        <EvidenceBar
-          supporting={cluster.evidence_bar.supporting}
-          contradicting={cluster.evidence_bar.contradicting}
-          null={cluster.evidence_bar.null}
-        />
-
-        {/* Confidence Gauge */}
-        <div className="flex-shrink-0 w-20 text-right">
-          <div className={`text-lg font-bold ${confidenceColor}`}>
-            {confidencePercent}%
-          </div>
-          <div className="text-xs text-gray-500">confidence</div>
-        </div>
-
-        {/* Best Evidence Type */}
-        <div className="px-2 py-1 bg-blue-50 rounded text-xs font-medium text-blue-700 flex-shrink-0">
-          {cluster.best_evidence_type}
-        </div>
-
-        {/* Contradiction Signal */}
-        {cluster.contradiction_signal.has_conflict && (
-          <div className="flex-shrink-0">
-            <AlertTriangle className={`w-5 h-5 ${
-              cluster.contradiction_signal.severity === 'HIGH'
-                ? 'text-red-500'
-                : cluster.contradiction_signal.severity === 'MEDIUM'
-                ? 'text-orange-500'
-                : 'text-yellow-500'
-            }`} />
-          </div>
-        )}
       </div>
     </button>
   );
 };
 
-/**
- * EVIDENCE BAR: Stacked bar showing supporting/contradicting/null claims
- */
-interface EvidenceBarProps {
+const LegendRow: React.FC = () => (
+  <div className="rounded-[16px] border border-neutral-200/80 bg-white/80 px-5 py-3 shadow-sm">
+    <div className="flex flex-col gap-3 text-xs text-neutral-500 md:flex-row md:items-center md:justify-between">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="font-semibold uppercase tracking-[0.12em] text-neutral-400">Evidence mix</span>
+        <LegendPill color="bg-emerald-500" label="Supporting" />
+        <LegendPill color="bg-rose-500" label="Contradicting" />
+        <LegendPill color="bg-slate-400" label="Neutral / unclear" />
+      </div>
+      <div className="font-medium text-neutral-500">Confidence combines percentage and qualitative label for quicker scanning.</div>
+    </div>
+  </div>
+);
+
+const LegendPill: React.FC<{ color: string; label: string }> = ({ color, label }) => (
+  <span className="inline-flex items-center gap-2 rounded-full bg-neutral-50 px-3 py-1.5 text-neutral-600 ring-1 ring-neutral-200">
+    <span className={`h-2.5 w-2.5 rounded-full ${color}`} />
+    {label}
+  </span>
+);
+
+const EvidenceDistribution: React.FC<{
   supporting: number;
   contradicting: number;
-  null: number;
-}
-
-const EvidenceBar: React.FC<EvidenceBarProps> = ({
-  supporting,
-  contradicting,
-  null: nullCount,
-}) => {
-  const total = supporting + contradicting + nullCount;
-  if (total === 0) return null;
-
-  const supportingPct = (supporting / total) * 100;
-  const contradictingPct = (contradicting / total) * 100;
-  const nullPct = (nullCount / total) * 100;
+  neutral: number;
+}> = ({ supporting, contradicting, neutral }) => {
+  const total = supporting + contradicting + neutral;
+  const safeTotal = total || 1;
+  const segments = [
+    { label: 'Support', count: supporting, width: (supporting / safeTotal) * 100, color: 'bg-emerald-500' },
+    { label: 'Conflict', count: contradicting, width: (contradicting / safeTotal) * 100, color: 'bg-rose-500' },
+    { label: 'Neutral', count: neutral, width: (neutral / safeTotal) * 100, color: 'bg-slate-400' },
+  ];
 
   return (
-    <div className="flex items-center gap-2 flex-shrink-0">
-      <div className="flex h-2 w-24 rounded-full overflow-hidden bg-gray-200">
-        {supporting > 0 && (
-          <div
-            className="bg-green-500"
-            style={{ width: `${supportingPct}%` }}
-            title={`${supporting} supporting`}
-          />
-        )}
-        {contradicting > 0 && (
-          <div
-            className="bg-red-500"
-            style={{ width: `${contradictingPct}%` }}
-            title={`${contradicting} contradicting`}
-          />
-        )}
-        {nullCount > 0 && (
-          <div
-            className="bg-gray-400"
-            style={{ width: `${nullPct}%` }}
-            title={`${nullCount} null results`}
-          />
+    <div className="min-w-0">
+      <div className="mb-2 flex items-center justify-between text-[11px] font-semibold uppercase tracking-[0.1em] text-neutral-400">
+        <span>Distribution</span>
+        <span>{total} total</span>
+      </div>
+      <div className="h-2.5 overflow-hidden rounded-full bg-neutral-200/80">
+        {segments.map((segment) =>
+          segment.count > 0 ? (
+            <div
+              key={segment.label}
+              className={`h-full ${segment.color} inline-block`}
+              style={{ width: `${segment.width}%` }}
+              title={`${segment.label}: ${segment.count}`}
+            />
+          ) : null
         )}
       </div>
-      <div className="text-xs text-gray-600 w-12 text-right">
-        {supporting}/{contradicting}/{nullCount}
+      <div className="mt-2 flex flex-wrap gap-2 text-xs text-neutral-500">
+        {segments.map((segment) => (
+          <span key={segment.label} className="inline-flex items-center gap-1.5 rounded-full bg-neutral-50 px-2.5 py-1 ring-1 ring-neutral-200">
+            <span className={`h-2 w-2 rounded-full ${segment.color}`} />
+            <span>{segment.label}</span>
+            <span className="font-medium text-neutral-700">{segment.count}</span>
+          </span>
+        ))}
       </div>
     </div>
   );
 };
 
-/**
- * EXPANDED CLUSTER DETAIL: Two-column layout
- */
-interface ExpandedClusterDetailProps {
-  cluster: EvidenceCluster;
-}
+const ConfidenceBadge: React.FC<{ confidence: number }> = ({ confidence }) => {
+  const percent = Math.round(confidence * 100);
+  const tone =
+    confidence >= 0.75
+      ? {
+          label: 'High',
+          ring: 'ring-emerald-200',
+          bg: 'bg-emerald-50',
+          value: 'text-emerald-700',
+          subtitle: 'text-emerald-700/80',
+        }
+      : confidence >= 0.55
+        ? {
+            label: 'Medium',
+            ring: 'ring-amber-200',
+            bg: 'bg-amber-50',
+            value: 'text-amber-700',
+            subtitle: 'text-amber-700/80',
+          }
+        : {
+            label: 'Low',
+            ring: 'ring-rose-200',
+            bg: 'bg-rose-50',
+            value: 'text-rose-700',
+            subtitle: 'text-rose-700/80',
+          };
 
-const ExpandedClusterDetail: React.FC<ExpandedClusterDetailProps> = ({
-  cluster,
-}) => {
   return (
-    <div className="bg-gray-50 border-t border-gray-100 p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Left: Claims List */}
-      <div className="lg:col-span-2">
-        <h4 className="text-sm font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <FileText className="w-4 h-4 text-blue-600" />
-          Claims in Cluster ({cluster.claims_summary.length})
-        </h4>
-        <div className="space-y-3 max-h-96 overflow-y-auto">
-          {cluster.claims_summary.map((claim, idx) => (
-            <ClaimRowDetail key={idx} claim={claim} />
-          ))}
-        </div>
-      </div>
+    <div className={`inline-flex w-fit min-w-[108px] flex-col rounded-2xl px-3 py-2.5 text-center shadow-sm ring-1 ${tone.bg} ${tone.ring}`}>
+      <div className={`text-2xl font-semibold tracking-[-0.03em] ${tone.value}`}>{percent}%</div>
+      <div className={`text-[11px] font-semibold uppercase tracking-[0.12em] ${tone.subtitle}`}>{tone.label} confidence</div>
+    </div>
+  );
+};
 
-      {/* Right: Metadata Panel */}
-      <div className="space-y-4">
-        {/* Statistics */}
-        <div className="bg-white rounded-lg p-4 border border-gray-200">
-          <h5 className="text-xs font-semibold text-gray-700 mb-3 uppercase">
-            Statistics
-          </h5>
-          <div className="space-y-2 text-xs">
-            <div className="flex justify-between">
-              <span className="text-gray-600">Average Confidence</span>
-              <span className="font-medium text-gray-900">
-                {(cluster.statistics.avg_confidence * 100).toFixed(0)}%
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-600">Confidence Range</span>
-              <span className="font-medium text-gray-900">
-                {(cluster.statistics.min_confidence * 100).toFixed(0)}%–
-                {(cluster.statistics.max_confidence * 100).toFixed(0)}%
-              </span>
-            </div>
+const MetaPill: React.FC<{ label: string; value: string | number }> = ({ label, value }) => (
+  <div className="rounded-2xl bg-neutral-100 px-3 py-2 text-left ring-1 ring-neutral-200">
+    <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-neutral-400">{label}</div>
+    <div className="mt-0.5 text-sm font-medium text-neutral-800">{value}</div>
+  </div>
+);
+
+const EvidenceTypeBadge: React.FC<{ type: string }> = ({ type }) => {
+  const normalized = type.toLowerCase();
+  const palette =
+    normalized.includes('safety')
+      ? 'bg-rose-50 text-rose-700 ring-rose-200'
+      : normalized.includes('comparative')
+        ? 'bg-violet-50 text-violet-700 ring-violet-200'
+        : normalized.includes('causal')
+          ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+          : normalized.includes('correlational')
+            ? 'bg-blue-50 text-blue-700 ring-blue-200'
+            : normalized.includes('prevalence')
+              ? 'bg-amber-50 text-amber-700 ring-amber-200'
+              : 'bg-slate-50 text-slate-700 ring-slate-200';
+
+  return (
+    <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold capitalize ring-1 ${palette}`}>
+      {type}
+    </span>
+  );
+};
+
+const StatusBadge: React.FC<{ tone: 'conflict' | 'warning' | 'neutral'; label: string }> = ({ tone, label }) => {
+  const palette =
+    tone === 'conflict'
+      ? 'bg-red-50 text-red-700 ring-red-200'
+      : tone === 'warning'
+        ? 'bg-amber-50 text-amber-700 ring-amber-200'
+        : 'bg-neutral-100 text-neutral-600 ring-neutral-200';
+
+  return (
+    <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-medium ring-1 ${palette}`}>
+      {label}
+    </span>
+  );
+};
+
+const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster }> = ({ cluster }) => {
+  return (
+    <div className="border-t border-neutral-200 bg-neutral-50/80 px-5 py-5">
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
+        <div className="min-w-0">
+          <SectionTitle icon={FileText} color="text-blue-600" title={`Claims in cluster (${cluster.claims_summary.length})`} />
+          <div className="mt-4 space-y-3">
+            {cluster.claims_summary.map((claim, idx) => (
+              <ClaimRowDetail key={`${claim.id}-${idx}`} claim={claim} />
+            ))}
           </div>
         </div>
 
-        {/* Contradiction Info */}
-        {cluster.contradiction_signal.has_conflict && (
-          <div className="bg-red-50 rounded-lg p-4 border border-red-200">
-            <h5 className="text-xs font-semibold text-red-900 mb-2 flex items-center gap-1">
-              <AlertTriangle className="w-3 h-3" />
-              Conflict Detected
-            </h5>
-            <p className="text-xs text-red-700">
-              {cluster.contradiction_signal.pairs.length} contradicting claim pair(s)
-            </p>
+        <div className="space-y-4">
+          <div className="rounded-[18px] border border-neutral-200 bg-white p-4 shadow-sm">
+            <SectionTitle icon={BarChart3} color="text-neutral-600" title="Cluster metrics" compact />
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+              <DetailMetricCard label="Average confidence" value={`${Math.round(cluster.statistics.avg_confidence * 100)}%`} />
+              <DetailMetricCard label="Confidence range" value={`${Math.round(cluster.statistics.min_confidence * 100)}–${Math.round(cluster.statistics.max_confidence * 100)}%`} />
+              <DetailMetricCard label="Best evidence type" value={cluster.best_evidence_type} />
+              <DetailMetricCard label="Conflict severity" value={cluster.contradiction_signal.has_conflict ? cluster.contradiction_signal.severity : 'None'} />
+            </div>
           </div>
-        )}
 
-        {/* Evidence Gaps */}
-        {cluster.evidence_gaps.length > 0 && (
-          <div className="bg-yellow-50 rounded-lg p-4 border border-yellow-200">
-            <h5 className="text-xs font-semibold text-yellow-900 mb-2 flex items-center gap-1">
-              <Zap className="w-3 h-3" />
-              Evidence Gaps ({cluster.evidence_gaps.length})
-            </h5>
-            <ul className="text-xs text-yellow-700 space-y-1">
-              {cluster.evidence_gaps.map((gap, idx) => (
-                <li key={idx} className="flex gap-2">
-                  <span className="flex-shrink-0 font-bold">•</span>
-                  <span>{gap.description}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+          {cluster.contradiction_signal.has_conflict && (
+            <div className="rounded-[18px] border border-red-200 bg-red-50/80 p-4 shadow-sm">
+              <SectionTitle icon={AlertTriangle} color="text-red-600" title="Confirmed conflict signal" compact />
+              <p className="mt-3 text-sm text-red-800">
+                {cluster.contradiction_signal.pairs.length} confirmed contradiction pair{cluster.contradiction_signal.pairs.length > 1 ? 's' : ''} are attached to this cluster.
+              </p>
+            </div>
+          )}
+
+          {cluster.evidence_gaps.length > 0 && (
+            <div className="rounded-[18px] border border-amber-200 bg-amber-50/80 p-4 shadow-sm">
+              <SectionTitle icon={Zap} color="text-amber-600" title={`Evidence gaps (${cluster.evidence_gaps.length})`} compact />
+              <div className="mt-3 space-y-2">
+                {cluster.evidence_gaps.map((gap, idx) => (
+                  <div key={`${gap.type}-${idx}`} className="rounded-2xl bg-white/70 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-100">
+                    {gap.description}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 };
 
-/**
- * CLAIM ROW DETAIL: Individual claim within cluster
- */
-interface ClaimRowDetailProps {
-  claim: ClaimSummary;
-}
-
-const ClaimRowDetail: React.FC<ClaimRowDetailProps> = ({ claim }) => {
+const ClaimRowDetail: React.FC<{ claim: ClaimSummary }> = ({ claim }) => {
   const directionIcon =
     claim.direction === 'positive' ? (
-      <TrendingUp className="w-3 h-3 text-green-600" />
+      <TrendingUp className="h-4 w-4 text-emerald-600" />
     ) : claim.direction === 'negative' ? (
-      <TrendingDown className="w-3 h-3 text-red-600" />
+      <TrendingDown className="h-4 w-4 text-rose-600" />
     ) : (
-      <Minus className="w-3 h-3 text-gray-600" />
+      <Minus className="h-4 w-4 text-slate-500" />
     );
 
-  const confidenceColor =
-    claim.confidence >= 0.7
-      ? 'text-green-600'
-      : claim.confidence >= 0.5
-      ? 'text-blue-600'
-      : 'text-yellow-600';
-
   return (
-    <div className="bg-white rounded p-3 border border-gray-200 text-xs space-y-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex items-start gap-2 flex-1 min-w-0">
-          {directionIcon}
-          <p className="text-gray-900 whitespace-normal">{claim.statement}</p>
+    <div className="rounded-[16px] border border-neutral-200 bg-white px-4 py-4 shadow-sm">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-neutral-50 ring-1 ring-neutral-200">
+            {directionIcon}
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-medium leading-6 text-neutral-900">{claim.statement}</p>
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-neutral-500">
+              <EvidenceTypeBadge type={claim.claim_type} />
+              <span
+                className="max-w-full break-words"
+                title={claim.paper_title}
+              >
+                {claim.paper_title}
+              </span>
+            </div>
+          </div>
         </div>
-        <span className={`font-bold flex-shrink-0 ${confidenceColor}`}>
-          {(claim.confidence * 100).toFixed(0)}%
-        </span>
-      </div>
-      <div className="flex items-center justify-between text-gray-600">
-        <span>{claim.claim_type}</span>
-        <span className="truncate">{claim.paper_title}</span>
+
+        <ConfidenceBadge confidence={claim.confidence} />
       </div>
     </div>
   );
 };
 
-/**
- * CONFLICTS VIEW: Show only clusters with contradictions
- */
-interface ConflictsViewProps {
-  clusters: EvidenceCluster[];
-  expandedClusterId: string | null;
-  onExpandChange: (id: string | null) => void;
-}
-
-const ConflictsView: React.FC<ConflictsViewProps> = ({
-  clusters,
-  expandedClusterId,
-  onExpandChange,
-}) => {
+const ConflictsView: React.FC<{ clusters: EvidenceCluster[] }> = ({ clusters }) => {
   if (clusters.length === 0) {
-    return (
-      <div className="p-12 text-center">
-        <AlertTriangle className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-        <p className="text-gray-600 font-medium mb-1">No conflicts detected</p>
-        <p className="text-gray-500 text-sm">
-          The evidence is aligned across all clusters
-        </p>
-      </div>
-    );
+    return <EmptyState icon={AlertTriangle} title="No conflicts detected" description="The evidence is aligned across all visible clusters." />;
   }
 
   return (
-    <div>
+    <div className="space-y-3 pb-8">
       {clusters.map((cluster, idx) => (
-        <div key={idx} className="border-b border-gray-100 last:border-0 p-4">
-          <div className="bg-red-50 rounded-lg p-4 border border-red-200">
-            <div className="flex items-start gap-4">
-              <AlertTriangle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-              <div className="flex-1 min-w-0">
-                <h4 className="text-sm font-semibold text-red-900 mb-2">
-                  {cluster.cluster_key.intervention_canonical} →{' '}
-                  {cluster.cluster_key.outcome_canonical}
-                </h4>
-                <div className="space-y-3">
-                  {cluster.contradiction_signal.pairs.map((pair, pIdx) => (
-                    <div
-                      key={pIdx}
-                      className="text-xs bg-white rounded p-3 border border-red-100"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <TrendingUp className="w-3 h-3 text-green-600" />
-                        <span className="font-medium">{pair.claim1_paper}</span>
-                      </div>
-                      <p className="text-gray-700 mb-3">
-                        Positive evidence: [claim 1]
-                      </p>
-
-                      <div className="flex items-center gap-2 mb-1">
-                        <TrendingDown className="w-3 h-3 text-red-600" />
-                        <span className="font-medium">{pair.claim2_paper}</span>
-                      </div>
-                      <p className="text-gray-700">
-                        Contradictory evidence: [claim 2]
-                      </p>
-                    </div>
-                  ))}
+        <div key={`${cluster.cluster_key.intervention_canonical}-${idx}`} className="rounded-[18px] border border-red-200 bg-white shadow-[0_10px_24px_rgba(15,23,42,0.045)]">
+          <div className="border-b border-red-100 bg-red-50/70 px-5 py-4">
+            <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+              <div>
+                <div className="text-base font-semibold text-neutral-950">
+                  {cluster.cluster_key.intervention_canonical} → {cluster.cluster_key.outcome_canonical}
+                </div>
+                <div className="mt-1 text-sm text-neutral-600">
+                  {cluster.contradiction_signal.severity} severity contradiction signal
                 </div>
               </div>
+              <ConfidenceBadge confidence={cluster.statistics.avg_confidence} />
             </div>
+          </div>
+
+          <div className="space-y-3 px-5 py-4">
+            {cluster.contradiction_signal.pairs.map((pair, pairIdx) => (
+              <div key={`${pair.claim1_id}-${pair.claim2_id}-${pairIdx}`} className="rounded-[16px] border border-neutral-200 bg-neutral-50/70 px-4 py-4">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <StatusBadge tone="conflict" label={pair.severity || cluster.contradiction_signal.severity} />
+                  <span className="text-xs text-neutral-500">
+                    {pair.claim1_direction} vs {pair.claim2_direction}
+                  </span>
+                </div>
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <ConflictSourceCard title={pair.claim1_paper} direction={pair.claim1_direction} />
+                  <ConflictSourceCard title={pair.claim2_paper} direction={pair.claim2_direction} />
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       ))}
@@ -664,15 +643,29 @@ const ConflictsView: React.FC<ConflictsViewProps> = ({
   );
 };
 
-/**
- * ENTITIES VIEW: Canonical entities vocabulary
- */
-interface EntitiesViewProps {
-  clusters: EvidenceCluster[];
-}
+const ConflictSourceCard: React.FC<{ title: string; direction: string }> = ({ title, direction }) => {
+  const positive = direction === 'positive';
+  const negative = direction === 'negative';
+  return (
+    <div className="rounded-[14px] border border-white bg-white px-4 py-3 shadow-sm ring-1 ring-neutral-200/80">
+      <div className="mb-2 flex items-center gap-2">
+        {positive ? (
+          <TrendingUp className="h-4 w-4 text-emerald-600" />
+        ) : negative ? (
+          <TrendingDown className="h-4 w-4 text-rose-600" />
+        ) : (
+          <Minus className="h-4 w-4 text-slate-500" />
+        )}
+        <span className="text-xs font-semibold uppercase tracking-[0.1em] text-neutral-400">{direction}</span>
+      </div>
+      <p className="text-sm font-medium leading-6 text-neutral-900" title={title}>
+        {title}
+      </p>
+    </div>
+  );
+};
 
-const EntitiesView: React.FC<EntitiesViewProps> = ({ clusters }) => {
-  // Extract unique canonical entities
+const EntitiesView: React.FC<{ clusters: EvidenceCluster[] }> = ({ clusters }) => {
   const interventions = new Set<string>();
   const outcomes = new Set<string>();
 
@@ -682,58 +675,81 @@ const EntitiesView: React.FC<EntitiesViewProps> = ({ clusters }) => {
   });
 
   if (interventions.size === 0 && outcomes.size === 0) {
-    return (
-      <div className="p-12 text-center">
-        <Activity className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-        <p className="text-gray-600 font-medium mb-1">No entities found</p>
-        <p className="text-gray-500 text-sm">
-          Extract claims to see canonical entities
-        </p>
-      </div>
-    );
+    return <EmptyState icon={Activity} title="No entities found" description="Extract claims to populate canonical interventions and outcomes." />;
   }
 
   return (
-    <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
-      {/* Interventions */}
-      <div>
-        <h4 className="text-sm font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <Zap className="w-4 h-4 text-blue-600" />
-          Interventions ({interventions.size})
-        </h4>
-        <div className="space-y-2">
-          {Array.from(interventions)
-            .sort()
-            .map((entity, idx) => (
-              <div
-                key={idx}
-                className="px-4 py-2 bg-blue-50 rounded-lg border border-blue-100 text-sm text-gray-900"
-              >
-                {entity}
-              </div>
-            ))}
-        </div>
-      </div>
-
-      {/* Outcomes */}
-      <div>
-        <h4 className="text-sm font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <Activity className="w-4 h-4 text-purple-600" />
-          Outcomes ({outcomes.size})
-        </h4>
-        <div className="space-y-2">
-          {Array.from(outcomes)
-            .sort()
-            .map((entity, idx) => (
-              <div
-                key={idx}
-                className="px-4 py-2 bg-purple-50 rounded-lg border border-purple-100 text-sm text-gray-900"
-              >
-                {entity}
-              </div>
-            ))}
-        </div>
-      </div>
+    <div className="grid gap-4 pb-8 lg:grid-cols-2">
+      <EntityColumn
+        title={`Interventions (${interventions.size})`}
+        icon={Zap}
+        iconColor="text-blue-600"
+        items={Array.from(interventions).sort()}
+        pillClassName="bg-blue-50 text-blue-700 ring-blue-100"
+      />
+      <EntityColumn
+        title={`Outcomes (${outcomes.size})`}
+        icon={Activity}
+        iconColor="text-violet-600"
+        items={Array.from(outcomes).sort()}
+        pillClassName="bg-violet-50 text-violet-700 ring-violet-100"
+      />
     </div>
   );
 };
+
+const EntityColumn: React.FC<{
+  title: string;
+  icon: React.ComponentType<{ className?: string }>;
+  iconColor: string;
+  items: string[];
+  pillClassName: string;
+}> = ({ title, icon: Icon, iconColor, items, pillClassName }) => (
+  <div className="rounded-[18px] border border-neutral-200 bg-white p-5 shadow-[0_10px_24px_rgba(15,23,42,0.045)]">
+    <SectionTitle icon={Icon} color={iconColor} title={title} />
+    <div className="mt-4 flex flex-wrap gap-2">
+      {items.map((item) => (
+        <span
+          key={item}
+          className={`inline-flex max-w-full break-words rounded-full px-3 py-2 text-sm font-medium ring-1 ${pillClassName}`}
+          title={item}
+        >
+          {item}
+        </span>
+      ))}
+    </div>
+  </div>
+);
+
+const SectionTitle: React.FC<{
+  icon: React.ComponentType<{ className?: string }>;
+  color: string;
+  title: string;
+  compact?: boolean;
+}> = ({ icon: Icon, color, title, compact = false }) => (
+  <div className="flex items-center gap-2">
+    <Icon className={`${compact ? 'h-4 w-4' : 'h-5 w-5'} ${color}`} />
+    <h4 className={`${compact ? 'text-sm' : 'text-base'} font-semibold text-neutral-900`}>{title}</h4>
+  </div>
+);
+
+const DetailMetricCard: React.FC<{ label: string; value: string }> = ({ label, value }) => (
+  <div className="rounded-[14px] bg-neutral-50 px-3 py-3 ring-1 ring-neutral-200">
+    <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-neutral-400">{label}</div>
+    <div className="mt-1 text-sm font-medium text-neutral-900">{value}</div>
+  </div>
+);
+
+const EmptyState: React.FC<{
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+}> = ({ icon: Icon, title, description }) => (
+  <div className="flex min-h-[18rem] flex-col items-center justify-center px-6 text-center">
+    <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-neutral-300 shadow-sm ring-1 ring-neutral-200">
+      <Icon className="h-7 w-7" />
+    </div>
+    <p className="text-base font-semibold text-neutral-800">{title}</p>
+    <p className="mt-1 max-w-md text-sm leading-6 text-neutral-500">{description}</p>
+  </div>
+);

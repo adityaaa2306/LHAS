@@ -3,6 +3,8 @@
  * Handles all backend communication
  */
 
+import type { MemoryGraphResponse, MonitoringOverview, MonitoringSnapshotView, MonitoringAlertRecordView, SynthesisVersion } from '@/types';
+
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 interface DashboardOverview {
@@ -123,8 +125,25 @@ class APIClient {
     return this.request<{ mission_id: string; papers: any[]; count: number }>(`/api/dashboard/missions/${missionId}/papers`);
   }
 
-  async getMissionSynthesis(missionId: string): Promise<{ mission_id: string; synthesis: any; message?: string }> {
-    return this.request<{ mission_id: string; synthesis: any; message?: string }>(`/api/dashboard/missions/${missionId}/synthesis`);
+  async getMissionSynthesis(missionId: string): Promise<{ mission_id: string; synthesis: SynthesisVersion | null; message?: string }> {
+    return this.request<{ mission_id: string; synthesis: SynthesisVersion | null; message?: string }>(`/api/synthesis/missions/${missionId}/latest`);
+  }
+
+  async getSynthesisHistory(missionId: string, limit: number = 10): Promise<{ mission_id: string; history: SynthesisVersion[]; count: number }> {
+    return this.request<{ mission_id: string; history: SynthesisVersion[]; count: number }>(`/api/synthesis/missions/${missionId}/history?limit=${limit}`);
+  }
+
+  async generateSynthesis(
+    missionId: string,
+    triggerType: string = 'operator_request',
+  ): Promise<{ mission_id: string; synthesis: SynthesisVersion }> {
+    return this.request<{ mission_id: string; synthesis: SynthesisVersion }>(
+      `/api/synthesis/missions/${missionId}/generate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ trigger_type: triggerType }),
+      },
+    );
   }
 
   async getMissionClaims(missionId: string, claimType?: string): Promise<{ mission_id: string; claims: any[]; count: number; filter: string }> {
@@ -222,6 +241,98 @@ class APIClient {
 
   async getClaimsStats(missionId: string): Promise<any> {
     return this.request<any>(`/api/claims/mission/${missionId}/stats`);
+  }
+
+  async getMemoryOverview(missionId: string): Promise<any> {
+    return this.request<any>(`/api/memory/missions/${missionId}/overview`);
+  }
+
+  async getMemorySnapshots(missionId: string): Promise<{ mission_id: string; snapshots: any[]; count: number }> {
+    return this.request<{ mission_id: string; snapshots: any[]; count: number }>(`/api/memory/missions/${missionId}/snapshots`);
+  }
+
+  async getMemoryDrift(missionId: string): Promise<{ mission_id: string; drift: any[]; count: number }> {
+    return this.request<{ mission_id: string; drift: any[]; count: number }>(`/api/memory/missions/${missionId}/drift`);
+  }
+
+  async getMemoryProvenance(
+    missionId: string,
+    options?: { claim_id?: string; paper_id?: string; limit?: number }
+  ): Promise<{ mission_id: string; events: any[]; count: number }> {
+    const params = new URLSearchParams();
+    if (options?.claim_id) params.append('claim_id', options.claim_id);
+    if (options?.paper_id) params.append('paper_id', options.paper_id);
+    if (options?.limit !== undefined) params.append('limit', options.limit.toString());
+    const queryString = params.toString();
+    return this.request<{ mission_id: string; events: any[]; count: number }>(
+      `/api/memory/missions/${missionId}/provenance${queryString ? `?${queryString}` : ''}`
+    );
+  }
+
+  async getMemoryContradictions(missionId: string): Promise<{ mission_id: string; contradictions: any[]; count: number }> {
+    return this.request<{ mission_id: string; contradictions: any[]; count: number }>(`/api/memory/missions/${missionId}/contradictions`);
+  }
+
+  async getMemoryGraph(
+    missionId: string,
+    options?: { max_nodes?: number; max_edges?: number },
+  ): Promise<MemoryGraphResponse> {
+    const params = new URLSearchParams();
+    if (options?.max_nodes !== undefined) params.append('max_nodes', options.max_nodes.toString());
+    if (options?.max_edges !== undefined) params.append('max_edges', options.max_edges.toString());
+    const queryString = params.toString();
+    return this.request<MemoryGraphResponse>(`/api/memory/missions/${missionId}/graph${queryString ? `?${queryString}` : ''}`);
+  }
+
+  async getContradictionOverview(missionId: string): Promise<any> {
+    return this.request<any>(`/api/contradictions/missions/${missionId}/overview`);
+  }
+
+  async getConfirmedContradictions(missionId: string): Promise<{ mission_id: string; contradictions: any[]; count: number }> {
+    return this.request<{ mission_id: string; contradictions: any[]; count: number }>(`/api/contradictions/missions/${missionId}/confirmed`);
+  }
+
+  async getResolvedContradictions(missionId: string): Promise<{ mission_id: string; resolved_pairs: any[]; count: number }> {
+    return this.request<{ mission_id: string; resolved_pairs: any[]; count: number }>(`/api/contradictions/missions/${missionId}/resolved`);
+  }
+
+  async getAmbiguousContradictions(missionId: string): Promise<{ mission_id: string; ambiguous_pairs: any[]; count: number }> {
+    return this.request<{ mission_id: string; ambiguous_pairs: any[]; count: number }>(`/api/contradictions/missions/${missionId}/ambiguous`);
+  }
+
+  async runContradictionCycle(missionId: string, evaluateAll: boolean = false): Promise<any> {
+    return this.request<any>(`/api/contradictions/missions/${missionId}/run-cycle?evaluate_all=${evaluateAll ? 'true' : 'false'}`, { method: 'POST' });
+  }
+
+  async getClaimMemoryDetail(claimId: string): Promise<any> {
+    return this.request<any>(`/api/memory/claims/${claimId}`);
+  }
+
+  async getMonitoringOverview(missionId: string): Promise<MonitoringOverview> {
+    return this.request<MonitoringOverview>(`/api/monitoring/missions/${missionId}/overview`);
+  }
+
+  async getMonitoringSnapshots(
+    missionId: string,
+    limit: number = 20,
+  ): Promise<{ mission_id: string; snapshots: MonitoringSnapshotView[]; count: number }> {
+    return this.request<{ mission_id: string; snapshots: MonitoringSnapshotView[]; count: number }>(
+      `/api/monitoring/missions/${missionId}/snapshots?limit=${limit}`,
+    );
+  }
+
+  async getMonitoringAlerts(
+    missionId: string,
+    status: 'active' | 'history' | 'all' = 'active',
+    limit: number = 100,
+  ): Promise<{ mission_id: string; alerts: MonitoringAlertRecordView[]; count: number; status: string }> {
+    return this.request<{ mission_id: string; alerts: MonitoringAlertRecordView[]; count: number; status: string }>(
+      `/api/monitoring/missions/${missionId}/alerts?status=${status}&limit=${limit}`,
+    );
+  }
+
+  async runMonitoringCycle(missionId: string): Promise<any> {
+    return this.request<any>(`/api/monitoring/missions/${missionId}/run-cycle`, { method: 'POST' });
   }
 }
 

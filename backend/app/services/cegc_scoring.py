@@ -54,6 +54,35 @@ class CEGCScoringService:
         
         self.method_patterns = r'(?:method|approach|protocol|procedure|technique|algorithm|model)'
         self.result_patterns = r'(?:result|finding|outcome|demonstrate|show|confirm)'
+
+    def _paper_text(self, paper: Any) -> str:
+        """Return the richest text available for scoring."""
+        title = paper.title or ""
+        abstract = paper.abstract or ""
+        full_text = getattr(paper, "full_text_content", None)
+        if full_text:
+            return f"{title}\n\n{full_text}".lower()
+        return f"{title} {abstract}".lower()
+
+    def _paper_excerpt_for_llm(self, paper: Any, max_chars: int = 6000) -> str:
+        """Use a bounded full-text excerpt for LLM verification."""
+        title = paper.title or ""
+        sections = getattr(paper, "full_text_sections", None) or {}
+        if sections:
+            preferred = ["abstract", "methods", "results", "discussion", "conclusion"]
+            parts = [f"Title: {title}"]
+            per_section_chars = max(800, max_chars // max(1, len(preferred)))
+            for name in preferred:
+                text = sections.get(name)
+                if text:
+                    parts.append(f"[{name.upper()}]\n{text[:per_section_chars]}")
+            excerpt = "\n\n".join(parts)
+            return excerpt[:max_chars]
+
+        full_text = getattr(paper, "full_text_content", None)
+        if full_text:
+            return f"Title: {title}\n\n{full_text[:max_chars]}"
+        return f"Title: {title}\nAbstract: {(paper.abstract or '')[:max_chars]}"
     
     async def score_papers(
         self,
@@ -167,10 +196,7 @@ class CEGCScoringService:
             intervention = query_pico.get('intervention', '').lower()
             outcome = query_pico.get('outcome', '').lower()
             
-            # Extract from paper abstract
-            abstract = (paper.abstract or '').lower()
-            title = (paper.title or '').lower()
-            paper_text = f"{title} {abstract}"
+            paper_text = self._paper_text(paper)
             
             scores = []
             
@@ -240,9 +266,7 @@ class CEGCScoringService:
         Returns: 0-1 score
         """
         try:
-            abstract = (paper.abstract or '').lower()
-            title = (paper.title or '').lower()
-            paper_text = f"{title} {abstract}"
+            paper_text = self._paper_text(paper)
             
             scores = []
             
@@ -313,9 +337,7 @@ class CEGCScoringService:
         Returns: 0-1 score
         """
         try:
-            abstract = (paper.abstract or '').lower()
-            title = (paper.title or '').lower()
-            paper_text = f"{title} {abstract}"
+            paper_text = self._paper_text(paper)
             
             # Extract query mechanism
             query_mechanism = query.get('mechanism', '')
@@ -376,9 +398,7 @@ class CEGCScoringService:
         Returns: 0-1 score
         """
         try:
-            abstract = (paper.abstract or '').lower()
-            title = (paper.title or '').lower()
-            paper_text = f"{title} {abstract}"
+            paper_text = self._paper_text(paper)
             
             query_assumptions = query.get('assumptions', [])
             
@@ -496,8 +516,7 @@ QUERY:
 - Assumptions: {query.get('assumptions', 'N/A')}
 
 PAPER:
-Title: {paper.title}
-Abstract: {paper.abstract[:800] if paper.abstract else 'N/A'}
+{self._paper_excerpt_for_llm(paper)}
 
 Evaluate:
 1. Does it address ALL PICO components? (Yes/No + explanation)

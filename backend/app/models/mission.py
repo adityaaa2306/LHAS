@@ -62,6 +62,9 @@ class Mission(Base):
     confidence_from_module1 = Column(Float, nullable=True)
     active_alerts = Column(Integer, default=0)
     session_count = Column(Integer, default=0)
+    contradiction_asymmetry_threshold = Column(Float, default=0.35, nullable=False)
+    benchmark_text = Column(Text, nullable=True)
+    benchmark_source = Column(String(255), nullable=True)
 
     # Ingestion status tracking (for background job pattern)
     ingestion_status = Column(String(20), default="idle", nullable=False)  # idle|pending|processing|completed|failed

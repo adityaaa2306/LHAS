@@ -193,7 +193,7 @@ class VerificationEngine:
                     chunks_text = ""
                     if claim_id in source_chunks_map:
                         for chunk in source_chunks_map[claim_id]:
-                            chunks_text += f"[{chunk.get('section', '?')}] {chunk.get('raw_text', '')}\n\n"
+                            chunks_text += f"[{chunk.get('section_name', chunk.get('section', '?'))}] {chunk.get('raw_text', '')}\n\n"
                     
                     claims_text += f"""
 Claim ID: {claim_id}
@@ -257,13 +257,7 @@ Output JSON only (no markdown, no explanation):
                         for result in results_data:
                             claim_id = result.get("claim_id")
                             is_supported = result.get("is_supported", "uncertain").lower()
-                            
-                            # Map partial to false with penalty
-                            if is_supported == "partial":
-                                is_supported = "false"
-                                conf_penalty = 0.75
-                            else:
-                                conf_penalty = 1.0
+                            conf_penalty = 0.75 if is_supported == "partial" else 1.0
                             
                             all_results.append(VerificationResult(
                                 claim_id=claim_id,

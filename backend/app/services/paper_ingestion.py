@@ -13,9 +13,15 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import insert, select
 from app.models import ResearchPaper, IngestionEvent, PaperSource, Mission
+from app.config import settings
 from app.services.llm import get_llm_provider
 from app.services.embeddings import get_embedding_service, EmbeddingService
 from app.services.claim_extraction import ClaimExtractionService
+from app.services.belief_revision import BeliefRevisionService
+from app.services.contradiction_handling import ContradictionHandlingService
+from app.services.memory_system import MemorySystemService
+from app.services.synthesis_generation import SynthesisGenerationService
+from app.models.memory import RawPaperStatus, SynthesisTrigger
 import time
 
 try:
@@ -61,6 +67,9 @@ class PaperObject:
     score_breakdown: Optional[Dict[str, float]] = field(default=None)  # {"pico": 0.93, ...}
     reasoning_graph: Optional[Dict[str, Any]] = field(default=None)  # LLM reasoning if Layer 5 applied
     mechanism_description: Optional[str] = field(default=None)  # Mechanism explanation
+    full_text_content: Optional[str] = field(default=None)  # Parsed PDF text for full-paper CEGC scoring
+    full_text_sections: Optional[Dict[str, str]] = field(default=None)  # section name -> text
+    full_text_source: Optional[str] = field(default=None)  # grobid|abstract_fallback|unavailable
     
     full_text_flag: int = field(default=0)
 
@@ -262,7 +271,7 @@ class SemanticScholarConnector:
             params = {
                 'query': query,
                 'limit': min(max_results, 100),
-                'fields': 'paperId,title,abstract,authors,year,externalIds,url,citationCount'
+                'fields': 'paperId,title,abstract,authors,year,externalIds,url,citationCount,openAccessPdf'
             }
             
             async with httpx.AsyncClient(timeout=30) as client:
@@ -310,6 +319,7 @@ class SemanticScholarConnector:
                         source=PaperSource.SEMANTIC_SCHOLAR,
                         doi=doi,
                         url=item.get('url'),
+                        pdf_url=(item.get('openAccessPdf') or {}).get('url'),
                         citations_count=item.get('citationCount'),
                         influence_score=item.get('influenceScore'),
                     )
@@ -526,6 +536,139 @@ class PubMedConnector:
             return []
 
 
+class GrobidFullTextExtractor:
+    """Parse open-access PDFs into sectioned text using a real GROBID service."""
+
+    def __init__(self, grobid_url: str):
+        self.grobid_url = grobid_url.rstrip("/")
+
+    async def parse_pdf_url(self, paper: PaperObject) -> bool:
+        """Populate full-text fields for a paper when a PDF URL is available."""
+        if not paper.pdf_url:
+            paper.full_text_source = "unavailable"
+            return False
+
+        try:
+            pdf_bytes = await self._download_pdf(paper.pdf_url)
+            if not pdf_bytes:
+                paper.full_text_source = "unavailable"
+                return False
+
+            tei_xml = await self._process_fulltext(pdf_bytes, paper)
+            if not tei_xml:
+                paper.full_text_source = "unavailable"
+                return False
+
+            sections = self._parse_tei_sections(tei_xml)
+            full_text = self._sections_to_text(sections)
+            if not full_text.strip():
+                paper.full_text_source = "unavailable"
+                return False
+
+            paper.full_text_sections = sections
+            paper.full_text_content = full_text
+            paper.full_text_source = "grobid"
+            paper.full_text_flag = 1
+            return True
+        except Exception as e:
+            logger.warning("Full-text parsing failed for '%s': %s", paper.title[:80], str(e))
+            paper.full_text_source = "unavailable"
+            return False
+
+    async def _download_pdf(self, pdf_url: str) -> Optional[bytes]:
+        async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
+            response = await client.get(pdf_url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            content = response.content
+            if "pdf" not in content_type and not content.startswith(b"%PDF"):
+                logger.warning("PDF URL did not return a PDF: %s (%s)", pdf_url, content_type)
+                return None
+            return content
+
+    async def _process_fulltext(self, pdf_bytes: bytes, paper: PaperObject) -> Optional[str]:
+        files = {
+            "input": (
+                f"{paper.paper_id}.pdf",
+                pdf_bytes,
+                "application/pdf",
+            )
+        }
+        data = {
+            "consolidateHeader": "1",
+            "consolidateCitations": "0",
+            "includeRawCitations": "0",
+            "includeRawAffiliations": "0",
+        }
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=90) as client:
+                    response = await client.post(
+                        f"{self.grobid_url}/api/processFulltextDocument",
+                        files=files,
+                        data=data,
+                    )
+                    response.raise_for_status()
+                    return response.text
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+        if last_error:
+            raise last_error
+        return None
+
+    def _parse_tei_sections(self, tei_xml: str) -> Dict[str, str]:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(tei_xml)
+        ns = {"tei": "http://www.tei-c.org/ns/1.0"}
+        sections: Dict[str, List[str]] = {}
+
+        abstract_parts = [
+            "".join(node.itertext()).strip()
+            for node in root.findall(".//tei:profileDesc/tei:abstract", ns)
+        ]
+        if abstract_parts:
+            sections["abstract"] = abstract_parts
+
+        for div in root.findall(".//tei:text/tei:body//tei:div", ns):
+            head = div.find("tei:head", ns)
+            section_name = "".join(head.itertext()).strip().lower() if head is not None else "body"
+            section_name = self._normalize_section_name(section_name)
+            paragraphs = [
+                " ".join("".join(paragraph.itertext()).split())
+                for paragraph in div.findall(".//tei:p", ns)
+            ]
+            paragraphs = [p for p in paragraphs if p]
+            if paragraphs:
+                sections.setdefault(section_name, []).extend(paragraphs)
+
+        return {name: "\n\n".join(parts) for name, parts in sections.items() if parts}
+
+    def _normalize_section_name(self, section_name: str) -> str:
+        if "method" in section_name or "material" in section_name:
+            return "methods"
+        if "result" in section_name or "finding" in section_name:
+            return "results"
+        if "discussion" in section_name:
+            return "discussion"
+        if "conclusion" in section_name:
+            return "conclusion"
+        if "introduction" in section_name or "background" in section_name:
+            return "introduction"
+        if "abstract" in section_name:
+            return "abstract"
+        return section_name or "body"
+
+    def _sections_to_text(self, sections: Dict[str, str]) -> str:
+        preferred_order = ["abstract", "introduction", "methods", "results", "discussion", "conclusion"]
+        ordered_names = [name for name in preferred_order if name in sections]
+        ordered_names.extend(name for name in sections if name not in ordered_names)
+        return "\n\n".join(f"[{name.upper()}]\n{sections[name]}" for name in ordered_names)
+
+
 class PaperIngestionService:
     """Main paper ingestion service implementing full pipeline"""
     
@@ -541,6 +684,25 @@ class PaperIngestionService:
         self.pubmed = PubMedConnector(pubmed_api_key)
         self.llm_provider = get_llm_provider()
         self.embedding_service = get_embedding_service()
+        self.memory_system = MemorySystemService(
+            db=db,
+            llm_provider=self.llm_provider,
+            embedding_service=self.embedding_service,
+        )
+        self.belief_revision = BeliefRevisionService(
+            db=db,
+            llm_provider=self.llm_provider,
+        )
+        self.contradiction_handling = ContradictionHandlingService(
+            db=db,
+            llm_provider=self.llm_provider,
+            embedding_service=self.embedding_service,
+        )
+        self.synthesis_generation = SynthesisGenerationService(
+            db=db,
+            llm_provider=self.llm_provider,
+        )
+        self.full_text_extractor = GrobidFullTextExtractor(settings.GROBID_URL)
         self.faiss_index = None
         self.faiss_mapping = {}  # Maps paper_id to FAISS index position
         
@@ -577,8 +739,8 @@ class PaperIngestionService:
             prefiltered = await self._stage4_prefilter(deduplicated, structured_query, config)
             logger.info(f"[{batch_id}] After prefilter: {len(prefiltered)}")
             
-            # STAGE 5: CEGC Soft Scoring (Layers 1-4, no LLM)
-            logger.info(f"[{batch_id}] Stage 5: CEGC soft scoring (layers 1-4)")
+            # STAGE 5: Full-text CEGC scoring (deterministic layers + selective LLM verification)
+            logger.info(f"[{batch_id}] Stage 5: Full-text CEGC scoring")
             scored, llm_calls, llm_tokens = await self._stage5_cegc_soft_scoring(
                 prefiltered, structured_query, config
             )
@@ -630,41 +792,51 @@ class PaperIngestionService:
                 mission = mission_result.scalar_one_or_none()
                 
                 if mission:
-                    claim_service = ClaimExtractionService(self.db)
+                    claim_service = ClaimExtractionService(
+                        self.db,
+                        llm_provider=self.llm_provider,
+                        embedding_service=self.embedding_service,
+                    )
                     mission_question = mission.normalized_query or "research claim"
                     mission_domain = mission.intent_type.value if mission.intent_type else "general"
                     
                     # Extract claims for each selected paper in parallel batches
                     total_claims_extracted = 0
-                    batch_size = 3  # Process 3 papers in parallel to avoid overwhelming LLM
+                    extracted_claim_ids: List[str] = []
+                    batch_size = 1  # AsyncSession is not safe for concurrent extraction writes
                     
                     for batch_start in range(0, len(selected), batch_size):
                         batch_end = min(batch_start + batch_size, len(selected))
                         paper_batch = selected[batch_start:batch_end]
                         
                         # Get paper IDs from database
-                        paper_ids_to_extract = []
+                        papers_to_extract = []
+                        seen_db_paper_ids = set()
                         for paper_obj in paper_batch:
                             paper_stmt = select(ResearchPaper).where(
                                 ResearchPaper.mission_id == mission_id,
-                                ResearchPaper.title == paper_obj.title
+                                ResearchPaper.paper_id == paper_obj.paper_id
                             )
                             paper_result = await self.db.execute(paper_stmt)
                             db_paper = paper_result.scalar_one_or_none()
-                            if db_paper:
-                                paper_ids_to_extract.append(db_paper.id)
+                            if db_paper and db_paper.id not in seen_db_paper_ids:
+                                papers_to_extract.append(db_paper)
+                                seen_db_paper_ids.add(db_paper.id)
                         
                         # Extract claims in parallel for this batch
-                        if paper_ids_to_extract:
+                        if papers_to_extract:
+                            paper_ids_to_extract = papers_to_extract
                             logger.info(f"  📄 Processing paper batch {batch_start // batch_size + 1}: {len(paper_ids_to_extract)} papers...")
                             extraction_tasks = [
                                 claim_service.extract_claims_from_paper(
-                                    paper_id=paper_id,
+                                    paper_id=db_paper.id,
                                     mission_id=mission_id,
                                     mission_question=mission_question,
                                     mission_domain=mission_domain,
+                                    pdf_url=db_paper.pdf_url,
+                                    abstract=db_paper.abstract or "",
                                 )
-                                for paper_id in paper_ids_to_extract
+                                for db_paper in papers_to_extract
                             ]
                             
                             extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
@@ -674,6 +846,13 @@ class PaperIngestionService:
                                 if isinstance(result, dict) and result.get('success'):
                                     claims_count = result.get('claims_extracted', 0)
                                     total_claims_extracted += claims_count
+                                    extracted_claim_ids.extend(
+                                        [
+                                            str(claim.get("id"))
+                                            for claim in (result.get("claims") or [])
+                                            if claim.get("id")
+                                        ]
+                                    )
                                     if claims_count > 0:
                                         logger.info(f"    ✅ Extracted {claims_count} claims from paper")
                                 elif isinstance(result, Exception):
@@ -697,6 +876,69 @@ class PaperIngestionService:
                     try:
                         await self.db.commit()
                         logger.info(f"[{batch_id}] Stage 12: Claims committed to database")
+                        try:
+                            contradiction_result = await self.contradiction_handling.run_cycle(
+                                mission_id=mission_id,
+                                new_claim_ids=extracted_claim_ids,
+                                actor="paper_ingestion",
+                                evaluate_all=not bool(extracted_claim_ids),
+                            )
+                            await self.db.commit()
+                            logger.info(
+                                f"[{batch_id}] Stage 12: Contradiction handling completed - "
+                                f"{contradiction_result.get('confirmed_contradictions', 0)} confirmed"
+                            )
+                        except Exception as contradiction_exc:
+                            logger.warning(f"[{batch_id}] Stage 12: Contradiction handling failed: {str(contradiction_exc)}")
+                            await self.db.rollback()
+                        try:
+                            revision_result = await self.belief_revision.run_revision_cycle(
+                                mission_id=mission_id,
+                                actor="paper_ingestion",
+                            )
+                            await self.db.commit()
+                            logger.info(
+                                f"[{batch_id}] Stage 12: Belief revision completed - "
+                                f"{revision_result.get('revision_type')} cycle {revision_result.get('cycle_number')}"
+                            )
+                        except Exception as revision_exc:
+                            logger.warning(f"[{batch_id}] Stage 12: Belief revision failed: {str(revision_exc)}")
+                            await self.db.rollback()
+                            revision_result = {"success": False}
+
+                        try:
+                            if revision_result.get("success") is False:
+                                raise RuntimeError("Belief revision did not complete successfully")
+                            synthesis_trigger = SynthesisGenerationService.trigger_from_revision(
+                                revision_result.get("revision_type"),
+                                revision_result.get("cycle_number"),
+                            )
+                            if synthesis_trigger:
+                                try:
+                                    await self.synthesis_generation.generate_synthesis(
+                                        mission_id=mission_id,
+                                        trigger=synthesis_trigger,
+                                        actor="paper_ingestion",
+                                    )
+                                    await self.db.commit()
+                                    logger.info(
+                                        f"[{batch_id}] Stage 12: Synthesis generated via {synthesis_trigger.value}"
+                                    )
+                                except Exception as synthesis_exc:
+                                    logger.warning(
+                                        f"[{batch_id}] Stage 12: Synthesis generation failed: {str(synthesis_exc)}"
+                                    )
+                                    await self.db.rollback()
+                            await self.memory_system.finalize_cycle(
+                                mission_id=mission_id,
+                                trigger=synthesis_trigger or SynthesisTrigger.NEW_PAPER,
+                                actor="paper_ingestion",
+                            )
+                            await self.db.commit()
+                            logger.info(f"[{batch_id}] Stage 12: Memory cycle finalized")
+                        except Exception as memory_exc:
+                            logger.warning(f"[{batch_id}] Stage 12: Memory finalization failed: {str(memory_exc)}")
+                            await self.db.rollback()
                     except Exception as commit_err:
                         logger.error(f"[{batch_id}] Stage 12: Failed to commit claims: {str(commit_err)}")
                         await self.db.rollback()
@@ -917,6 +1159,14 @@ Return JSON only:
             embedding_service=self.embedding_service,
         )
         
+        logger.info(f"[{batch_id}] Stage 5: Parsing full PDFs for {len(papers)} papers before CEGC scoring")
+        papers = await self._enrich_with_full_text(papers)
+        parsed_count = sum(1 for paper in papers if paper.full_text_source == "grobid")
+        logger.info(
+            f"[{batch_id}] Stage 5: Full-text available for {parsed_count}/{len(papers)} papers; "
+            "remaining papers will use title + abstract fallback"
+        )
+        
         logger.info(f"[{batch_id}] Stage 5: CEGC scoring {len(papers)} papers through 5-layer pipeline")
         
         # Score papers through all 5 layers
@@ -945,6 +1195,22 @@ Return JSON only:
                         f"'{paper.title[:40]}...'")
         
         return scored_papers, llm_calls, llm_tokens
+
+    async def _enrich_with_full_text(self, papers: List[PaperObject]) -> List[PaperObject]:
+        """Parse each available PDF with GROBID so CEGC can score full-paper text."""
+        semaphore = asyncio.Semaphore(3)
+
+        async def parse_one(paper: PaperObject) -> PaperObject:
+            if not paper.pdf_url:
+                paper.full_text_source = "abstract_fallback"
+                return paper
+            async with semaphore:
+                parsed = await self.full_text_extractor.parse_pdf_url(paper)
+                if not parsed:
+                    paper.full_text_source = "abstract_fallback"
+                return paper
+
+        return await asyncio.gather(*(parse_one(paper) for paper in papers))
     
     async def _stage6_cegc_deep_analysis(
         self,
@@ -1041,6 +1307,13 @@ Return JSON only:
         intersection = len(words1 & words2)
         union = len(words1 | words2)
         return intersection / union if union > 0 else 0.0
+
+    def _paper_storage_key(self, paper: PaperObject | ResearchPaper) -> str:
+        if getattr(paper, "paper_id", None):
+            return f"id:{paper.paper_id}"
+        title = (getattr(paper, "title", "") or "").strip().lower()
+        source = getattr(getattr(paper, "source", None), "value", getattr(paper, "source", "unknown"))
+        return f"title:{source}:{title}"
     
     def _stage8_fulltext_decision(self, papers: List[PaperObject]) -> List[PaperObject]:
         """STAGE 8: Decide if full-text parsing needed"""
@@ -1058,53 +1331,95 @@ Return JSON only:
         papers: List[PaperObject],
         structured_query: dict
     ):
-        """STAGE 9: Store papers in PostgreSQL with CEGC scores"""
-        for rank, paper in enumerate(papers, 1):
-            stmt = insert(ResearchPaper).values(
-                mission_id=mission_id,
-                paper_id=paper.paper_id,
-                doi=paper.doi,
-                title=paper.title,
-                authors=paper.authors,
-                abstract=paper.abstract,
-                year=paper.year,
-                source=paper.source,
-                arxiv_url=paper.url if paper.source == PaperSource.ARXIV else None,
-                semantic_scholar_url=paper.url if paper.source == PaperSource.SEMANTIC_SCHOLAR else None,
-                pubmed_url=paper.url if paper.source == PaperSource.PUBMED else None,
-                pdf_url=paper.pdf_url,
-                final_score=paper.final_score,  # CEGC final score
-                
-                # CEGC component scores (Layers 1-5)
-                pico_match_score=paper.pico_match_score,
-                evidence_strength_score=paper.evidence_strength_score,
-                mechanism_agreement_score=paper.mechanism_agreement_score,
-                assumption_alignment_score=paper.assumption_alignment_score,
-                llm_verification_score=paper.llm_verification_score,
-                
-                # CEGC reasoning data
-                score_breakdown=paper.score_breakdown,
-                reasoning_graph=paper.reasoning_graph,
-                mechanism_description=paper.mechanism_description,
-                
-                # Embeddings
-                embedding=paper.embedding,
-                
-                # Selection and processing flags
-                selected=1,
-                full_text_flag=getattr(paper, 'full_text_flag', 0),
-                ingestion_batch_id=batch_id,
-                rank_in_ingestion=rank,
-                
-                # Metadata
-                keywords=paper.keywords,
-                citations_count=paper.citations_count,
-                influence_score=paper.influence_score,
+        """STAGE 9: Store papers in PostgreSQL with dedupe/update semantics."""
+        existing_rows = (
+            await self.db.execute(
+                select(ResearchPaper).where(ResearchPaper.mission_id == mission_id)
             )
-            await self.db.execute(stmt)
-        
+        ).scalars().all()
+
+        existing_by_key = {}
+        duplicate_rows = []
+        for row in existing_rows:
+            key = self._paper_storage_key(row)
+            if key in existing_by_key:
+                duplicate_rows.append(row)
+            else:
+                existing_by_key[key] = row
+
+        for duplicate in duplicate_rows:
+            await self.db.delete(duplicate)
+
+        seen_batch_keys = set()
+        stored_count = 0
+
+        for rank, paper in enumerate(papers, 1):
+            key = self._paper_storage_key(paper)
+            if key in seen_batch_keys:
+                logger.info("Skipping duplicate paper in ingestion batch: %s", paper.title[:120])
+                continue
+            seen_batch_keys.add(key)
+
+            db_paper = existing_by_key.get(key)
+            if db_paper is None:
+                db_paper = ResearchPaper(
+                    mission_id=mission_id,
+                    paper_id=paper.paper_id,
+                    source=paper.source,
+                    final_score=paper.final_score,
+                )
+                self.db.add(db_paper)
+                existing_by_key[key] = db_paper
+
+            db_paper.doi = paper.doi
+            db_paper.title = paper.title
+            db_paper.authors = paper.authors
+            db_paper.abstract = paper.abstract
+            db_paper.year = paper.year
+            db_paper.source = paper.source
+            db_paper.arxiv_url = paper.url if paper.source == PaperSource.ARXIV else None
+            db_paper.semantic_scholar_url = paper.url if paper.source == PaperSource.SEMANTIC_SCHOLAR else None
+            db_paper.pubmed_url = paper.url if paper.source == PaperSource.PUBMED else None
+            db_paper.pdf_url = paper.pdf_url
+            db_paper.final_score = paper.final_score
+            db_paper.pico_match_score = paper.pico_match_score
+            db_paper.evidence_strength_score = paper.evidence_strength_score
+            db_paper.mechanism_agreement_score = paper.mechanism_agreement_score
+            db_paper.assumption_alignment_score = paper.assumption_alignment_score
+            db_paper.llm_verification_score = paper.llm_verification_score
+            db_paper.score_breakdown = paper.score_breakdown
+            db_paper.reasoning_graph = paper.reasoning_graph
+            db_paper.mechanism_description = paper.mechanism_description
+            db_paper.embedding = paper.embedding
+            db_paper.selected = 1
+            db_paper.full_text_flag = getattr(paper, 'full_text_flag', 0)
+            db_paper.full_text_content = paper.full_text_content
+            db_paper.ingestion_batch_id = batch_id
+            db_paper.rank_in_ingestion = rank
+            db_paper.keywords = paper.keywords
+            db_paper.citations_count = paper.citations_count
+            db_paper.influence_score = paper.influence_score
+            await self.db.flush()
+            for attempt in range(2):
+                try:
+                    await self.memory_system.record_paper_record(
+                        paper=db_paper,
+                        actor="paper_ingestion",
+                        status=RawPaperStatus.INGESTED,
+                    )
+                    break
+                except Exception as memory_exc:
+                    logger.warning(
+                        "Memory paper record write failed for %s (attempt %s/2): %s | title=%s",
+                        db_paper.id,
+                        attempt + 1,
+                        memory_exc,
+                        db_paper.title[:160],
+                    )
+            stored_count += 1
+
         await self.db.commit()
-        logger.info(f"Stored {len(papers)} papers (with CEGC scores) for mission {mission_id}")
+        logger.info(f"Stored {stored_count} unique papers (with CEGC scores) for mission {mission_id}")
     
     async def _stage10_faiss_indexing(self, mission_id: str, papers: List[PaperObject]):
         """STAGE 10: Create FAISS index for semantic search"""

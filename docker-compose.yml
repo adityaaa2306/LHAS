@@ -45,6 +45,7 @@ services:
     environment:
       # Database connection - use service name 'postgres' not localhost
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-aditya}@postgres:5432/${POSTGRES_DB:-LHAS}
+      GROBID_URL: http://grobid:8070
       
       # CORS - include all frontend URLs
       CORS_ORIGINS: http://localhost:3000,http://localhost:5173,http://frontend:3000,http://frontend:80
@@ -53,6 +54,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      grobid:
+        condition: service_started
     volumes:
       # Backend storage volume for uploaded files, FAISS indices, etc.
       - backend_storage:/app/storage
@@ -70,6 +73,16 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # GROBID PDF parser for full-text paper analysis
+  grobid:
+    image: lfoppiano/grobid:${GROBID_VERSION:-0.8.0}
+    container_name: lhas-grobid
+    ports:
+      - "${GROBID_PORT:-8070}:8070"
+    networks:
+      - lhas-network
+    restart: unless-stopped
 
   # React Frontend Application
   frontend:
