@@ -1548,8 +1548,8 @@ class ClaimExtractionService:
                     "source_chunk_ids": [1],
                     "evidence_span": "Exact supporting text copied verbatim from the chunk",
                     "grounding_confidence": 0.85,
-                    "intervention": "Semaglutide",
-                    "outcome": "Weight loss",
+                    "intervention": "Example intervention",
+                    "outcome": "Example outcome",
                     "direction": "positive",
                     "hedging_text": None,
                     "section_source": "results",
@@ -1906,8 +1906,8 @@ Return strict JSON only using this schema:
             [
                 {
                     "claim_id": "uuid",
-                    "intervention_canonical": "semaglutide",
-                    "outcome_canonical": "weight loss",
+                    "intervention_canonical": "example intervention",
+                    "outcome_canonical": "example outcome",
                     "normalization_confidence": 0.85,
                 }
             ],

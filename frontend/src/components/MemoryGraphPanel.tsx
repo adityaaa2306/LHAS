@@ -340,7 +340,7 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
             <div className="absolute bottom-4 left-4 z-20 flex flex-wrap gap-2">
               {selectedNode && (
                 <div className="rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs font-medium text-white backdrop-blur-md">
-                  Focus mode: {selectedNode.connected_count} connected claims
+                  Focus mode: showing this claim plus {selectedNode.connected_count} directly connected claim{selectedNode.connected_count === 1 ? '' : 's'}
                 </div>
               )}
               {layoutMode === 'timeline' && (

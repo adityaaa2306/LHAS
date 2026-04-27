@@ -24,10 +24,12 @@ import { apiClient } from '@/services/api';
 import { PaperLevelGraph, ComparisonGraph, MissionLevelGraph } from '@/components/CEGCGraphs';
 import { ClaimsExplorer } from '@/components/ClaimsExplorer';
 import { AlignmentMonitorPanel } from '@/components/AlignmentMonitorPanel';
+import { ExpandableText } from '@/components/ExpandableText';
 import { ContradictionHandlingPanel } from '@/components/ContradictionHandlingPanel';
 import { MemorySystemPanel } from '@/components/MemorySystemPanel';
 import { ScrollFadePanel } from '@/components/ScrollFadePanel';
 import type { ConfirmedContradiction, MemoryOverview, MissionSnapshot, MonitoringOverview, SynthesisVersion } from '@/types';
+import { buildBeliefSummary, formatReasoningOutcome } from '@/utils/missionNarratives';
 
 interface MissionDetailData {
   id: string;
@@ -587,7 +589,15 @@ export const MissionDetailPage: React.FC = () => {
             <h1 className="text-xl font-serif font-bold text-neutral-900 mb-2 leading-tight">
               {mission.name}
             </h1>
-            <p className="text-sm italic text-neutral-600 line-clamp-3">{mission.query}</p>
+            <ExpandableText
+              text={mission.query}
+              collapsedLines={3}
+              minCharactersToCollapse={140}
+              textClassName="text-sm italic text-neutral-600 leading-6"
+              buttonClassName="text-[11px]"
+              expandLabel="Expand problem"
+              collapseLabel="Collapse problem"
+            />
             <div className="flex gap-2 mt-3">
               <span
                 className={`text-xs font-semibold px-2.5 py-1 rounded-full flex items-center gap-1.5 ${
@@ -1029,6 +1039,9 @@ const ModernSynthesisCard: React.FC<{
     }
     return Array.from(grouped.values());
   }, [includedContradictions]);
+  const focusClusterCount = synthesis?.summary_metrics.focus_cluster_count ?? 1;
+  const synthesisEvidencePoolCount = synthesis?.summary_metrics.evidence_claim_pool_count
+    ?? ((synthesis?.claim_ids_tier1.length || 0) + (synthesis?.claim_ids_tier2.length || 0) + (synthesis?.claim_ids_tier3.length || 0));
 
   return (
   <div className="overflow-hidden rounded-2xl border border-neutral-200/80 bg-white shadow-[0_18px_50px_rgba(15,23,42,0.06)]">
@@ -1093,14 +1106,14 @@ const ModernSynthesisCard: React.FC<{
             <SynthesisStatCard
               label="Core Claims"
               value={`${synthesis.summary_metrics.tier1_count}`}
-              detail={`${synthesis.summary_metrics.tier2_count} supporting`}
+              detail={`${focusClusterCount} focus clusters · ${synthesisEvidencePoolCount} claims in synthesis pool`}
               actionLabel="View claims"
               onAction={() => setDetailView(detailView === 'tier1' ? null : 'tier1')}
             />
             <SynthesisStatCard
               label="Contradictions"
               value={`${includedContradictionTopics.length}`}
-              detail={`${synthesis.contradictions_included.length} pair records · ${synthesis.summary_metrics.high_contradictions} high-severity topics`}
+              detail={`${synthesis.contradictions_included.length} pair records surfaced · ${synthesis.summary_metrics.high_contradictions} high-severity topics`}
               actionLabel="View conflicts"
               onAction={() => setDetailView(detailView === 'contradictions' ? null : 'contradictions')}
             />
@@ -1111,7 +1124,7 @@ const ModernSynthesisCard: React.FC<{
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h3 className="text-sm font-semibold text-blue-900">Tier 1 Core Claims</h3>
-                  <p className="text-xs text-blue-700">These are the exact high-priority claims anchoring the synthesis.</p>
+                  <p className="text-xs text-blue-700">These are the highest-priority claims anchoring the synthesis across the selected focus clusters.</p>
                 </div>
                 <button
                   type="button"
@@ -1239,7 +1252,15 @@ const ModernSynthesisCard: React.FC<{
                       </div>
                       <SynthesisPill className={tierPillClass(String(version.confidence_tier))} label={String(version.confidence_tier)} />
                     </div>
-                    <p className="mt-3 text-sm leading-6 text-neutral-700 line-clamp-3">{version.synthesis_text}</p>
+                    <ExpandableText
+                      text={version.synthesis_text}
+                      collapsedLines={4}
+                      minCharactersToCollapse={180}
+                      textClassName="mt-3 text-sm leading-6 text-neutral-700"
+                      buttonClassName="text-[11px]"
+                      expandLabel="Read full version"
+                      collapseLabel="Show less"
+                    />
                   </div>
                 ))}
               </div>
@@ -1251,6 +1272,8 @@ const ModernSynthesisCard: React.FC<{
                 <p>Tier 1 claim IDs: {synthesis.claim_ids_tier1.length}</p>
                 <p>Tier 2 claim IDs: {synthesis.claim_ids_tier2.length}</p>
                 <p>Tier 3 claim IDs: {synthesis.claim_ids_tier3.length}</p>
+                <p>Focus clusters: {focusClusterCount}</p>
+                <p>Synthesis evidence pool: {synthesisEvidencePoolCount}</p>
                 <p>Contradictions included: {synthesis.contradictions_included.length}</p>
                 <p>{synthesis.llm_fallback ? 'Template fallback was used for this version.' : 'Narrative was produced by the synthesis writer.'}</p>
               </div>
@@ -1408,8 +1431,16 @@ const MissionDashboardSection: React.FC<{
       <div className="px-6 py-6">
         {synthesis ? (
           <div className="space-y-4">
-            <p className="text-[15px] leading-8 text-neutral-800">
-              {synthesis.synthesis_text}
+            <ExpandableText
+              text={synthesis.synthesis_text}
+              collapsedLines={5}
+              minCharactersToCollapse={240}
+              textClassName="text-[15px] leading-8 text-neutral-800"
+              expandLabel="Preview more"
+              collapseLabel="Show less preview"
+            />
+            <p className="text-xs text-neutral-500">
+              Dashboard shows a quick preview. Open Central Synthesis for the full narrative, evidence tiers, and version context.
             </p>
           </div>
         ) : (
@@ -1933,14 +1964,20 @@ const CollapsibleResearchPaper: React.FC<{
 // ============ REASONING CARD ============
 
 const ReasoningCard: React.FC<{ reasoning: any[]; memoryOverview: MemoryOverview | null }> = ({ reasoning, memoryOverview }) => {
-  const currentBelief = memoryOverview?.latest_snapshot?.current_belief_statement
-    || 'No belief statement has been formed yet.';
   const currentConfidence = memoryOverview?.belief_state?.current_confidence_score
     ?? memoryOverview?.latest_snapshot?.current_confidence_score
     ?? null;
   const currentDirection = memoryOverview?.belief_state?.dominant_evidence_direction
     ?? memoryOverview?.latest_snapshot?.dominant_evidence_direction
     ?? 'mixed';
+  const currentBelief = buildBeliefSummary({
+    statement:
+      memoryOverview?.belief_state?.current_belief_statement
+      || memoryOverview?.latest_snapshot?.current_belief_statement,
+    direction: currentDirection,
+    confidence: currentConfidence,
+    contradictionCount: memoryOverview?.graph?.contradictions ?? 0,
+  });
 
   const formatRevisionTitle = (step: any) => {
     const conclusion = String(step?.conclusion || '').toUpperCase();
@@ -2008,7 +2045,7 @@ const ReasoningCard: React.FC<{ reasoning: any[]; memoryOverview: MemoryOverview
                 {step.conclusion && (
                   <div className="mt-3 rounded-md bg-neutral-50 border border-neutral-200 px-3 py-2">
                     <p className="text-xs font-medium text-neutral-500 mb-1">System outcome</p>
-                    <p className="text-sm text-neutral-800">{step.conclusion}</p>
+                    <p className="text-sm text-neutral-800">{formatReasoningOutcome(step.conclusion)}</p>
                   </div>
                 )}
               </div>

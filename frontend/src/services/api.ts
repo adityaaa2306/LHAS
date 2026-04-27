@@ -239,6 +239,10 @@ class APIClient {
     return this.request<any>(endpoint);
   }
 
+  async getClaim(claimId: string): Promise<any> {
+    return this.request<any>(`/api/claims/${claimId}`);
+  }
+
   async getClaimsStats(missionId: string): Promise<any> {
     return this.request<any>(`/api/claims/mission/${missionId}/stats`);
   }

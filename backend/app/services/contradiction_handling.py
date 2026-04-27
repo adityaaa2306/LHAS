@@ -25,7 +25,12 @@ from app.models.contradiction import (
     VerificationStageEnum,
 )
 from app.models.memory import ClaimGraphEdge, GraphEdgeType, MemoryEventType
-from app.services.claim_curation import claim_direction_value
+from app.services.claim_curation import (
+    claim_context_key,
+    claim_direction_value,
+    claim_finding_key,
+    claim_metadata_completeness,
+)
 from app.services.embeddings import get_embedding_service
 from app.services.llm import get_llm_provider
 from app.services.memory_system import MemorySystemService, _claim_statement, _confidence_product, _edge_weight
@@ -84,6 +89,40 @@ def _directions_opposed(left: str, right: str) -> bool:
         ("negative", "null"),
         ("null", "negative"),
     }
+
+
+def _human_direction(direction: Any) -> str:
+    normalized = _normalized_text(direction)
+    if normalized == "positive":
+        return "helps or lowers risk"
+    if normalized == "negative":
+        return "harms or raises risk"
+    if normalized == "null":
+        return "has little clear effect"
+    return "has an unclear effect"
+
+
+def _plain_language_contradiction_summary(
+    intervention: Any,
+    outcome: Any,
+    direction_a: Any,
+    direction_b: Any,
+) -> str:
+    safe_intervention = str(intervention or "this intervention")
+    safe_outcome = str(outcome or "this outcome")
+    left = _normalized_text(direction_a)
+    right = _normalized_text(direction_b)
+
+    if {left, right} == {"positive", "negative"}:
+        return f"The system found studies that disagree about whether {safe_intervention} helps or harms {safe_outcome}."
+    if {left, right} == {"positive", "null"}:
+        return f"The system found studies that disagree about whether {safe_intervention} clearly helps {safe_outcome} or shows little clear effect."
+    if {left, right} == {"negative", "null"}:
+        return f"The system found studies that disagree about whether {safe_intervention} harms {safe_outcome} or shows little clear effect."
+    return (
+        f"The system found claims about {safe_intervention} and {safe_outcome} that point in different directions: "
+        f"one says it {_human_direction(direction_a)}, while the other says it {_human_direction(direction_b)}."
+    )
 
 
 class ContradictionHandlingService:
@@ -316,6 +355,8 @@ class ContradictionHandlingService:
             if not await self._is_known_contradiction(mission.id, pair.new_claim.id, pair.existing_claim.id):
                 filtered.append(pair)
 
+        filtered = self._deduplicate_candidate_pairs(filtered)
+
         if len(filtered) > 20:
             filtered.sort(key=lambda item: _confidence_product(item.new_claim, item.existing_claim), reverse=True)
             await self.memory_system.log_event(
@@ -328,6 +369,23 @@ class ContradictionHandlingService:
             )
             filtered = filtered[:20]
         return filtered
+
+    def _candidate_rank(self, pair: CandidatePair) -> Tuple[float, float, float]:
+        return (
+            _confidence_product(pair.new_claim, pair.existing_claim),
+            claim_metadata_completeness(pair.existing_claim),
+            _study_score(pair.existing_claim),
+        )
+
+    def _deduplicate_candidate_pairs(self, pairs: Sequence[CandidatePair]) -> List[CandidatePair]:
+        """Collapse near-duplicate candidates so one broad topic does not explode into pair spam."""
+        deduped: Dict[str, CandidatePair] = {}
+        for pair in pairs:
+            bucket = claim_finding_key(pair.existing_claim)
+            current = deduped.get(bucket)
+            if current is None or self._candidate_rank(pair) > self._candidate_rank(current):
+                deduped[bucket] = pair
+        return list(deduped.values())
 
     async def _exact_entity_matches(self, claim: ResearchClaim) -> List[ResearchClaim]:
         if not claim.intervention_canonical or not claim.outcome_canonical:
@@ -890,6 +948,8 @@ class ContradictionHandlingService:
 
     async def _confirmed_record_response(self, record: ContradictionRecord) -> Dict[str, Any]:
         edge = await self.db.get(ClaimGraphEdge, record.graph_edge_id) if record.graph_edge_id else None
+        claim_a = await self.db.get(ResearchClaim, record.claim_a_id)
+        claim_b = await self.db.get(ResearchClaim, record.claim_b_id)
         return {
             "id": str(record.id),
             "mission_id": record.mission_id,
@@ -917,6 +977,16 @@ class ContradictionHandlingService:
             "study_design_delta": edge.study_design_delta if edge else record.quality_parity_delta,
             "recency_weight": edge.recency_weight if edge else None,
             "justification": edge.justification if edge else None,
+            "claim_a_statement": _claim_statement(claim_a) if claim_a else None,
+            "claim_b_statement": _claim_statement(claim_b) if claim_b else None,
+            "claim_a_paper_title": getattr(claim_a, "paper_title", None),
+            "claim_b_paper_title": getattr(claim_b, "paper_title", None),
+            "plain_language_summary": _plain_language_contradiction_summary(
+                record.intervention_canonical,
+                record.outcome_canonical,
+                record.direction_a,
+                record.direction_b,
+            ),
         }
 
     def _context_resolved_response(self, row: ContextResolvedPairRecord) -> Dict[str, Any]:

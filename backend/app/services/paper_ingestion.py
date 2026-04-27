@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import uuid
 from datetime import datetime
 from typing import Any, Optional, Dict, List, Tuple
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 from app.models import ResearchPaper, IngestionEvent, PaperSource, Mission
 from app.config import settings
 from app.services.llm import get_llm_provider
@@ -868,6 +869,25 @@ class PaperIngestionService:
                                     await self.db.rollback()
                                 except:
                                     pass
+
+                            try:
+                                processed_batches = (batch_start // batch_size) + 1
+                                total_batches = max(1, math.ceil(len(selected) / batch_size))
+                                extraction_progress = 60 + int((processed_batches / total_batches) * 30)
+                                extraction_progress = min(extraction_progress, 90)
+                                await self.db.execute(
+                                    update(Mission)
+                                    .where(Mission.id == mission_id)
+                                    .values(
+                                        ingestion_status="processing",
+                                        ingestion_progress=extraction_progress,
+                                    )
+                                )
+                                await self.db.commit()
+                            except Exception as progress_err:
+                                logger.debug(
+                                    f"[{batch_id}] Failed to update ingestion progress during extraction: {progress_err}"
+                                )
                     
                     logger.info(f"🎯 [CLAIM EXTRACTION] ✅ Total {total_claims_extracted} claims extracted and stored in database")
                     logger.info(f"[{batch_id}] Stage 12: Claim extraction completed - {total_claims_extracted} total claims extracted")

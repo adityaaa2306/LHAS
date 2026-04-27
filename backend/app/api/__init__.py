@@ -8,6 +8,7 @@ from .belief import router as belief_router
 from .contradictions import router as contradictions_router
 from .synthesis import router as synthesis_router
 from .monitoring import router as monitoring_router
+from .evaluation import router as evaluation_router
 
 api_router = APIRouter()
 api_router.include_router(dashboard_router)
@@ -19,5 +20,6 @@ api_router.include_router(belief_router)
 api_router.include_router(contradictions_router)
 api_router.include_router(synthesis_router)
 api_router.include_router(monitoring_router)
+api_router.include_router(evaluation_router)
 
 __all__ = ["api_router"]

@@ -20,6 +20,7 @@ from app.services.claim_curation import (
     build_mission_findings,
     claim_confidence,
     claim_direction_value,
+    claim_metadata_completeness,
     claim_section,
     claim_type_value,
     summarize_findings,
@@ -228,6 +229,10 @@ async def get_claim_statistics(
                     ) if findings else 0.0,
                     1,
                 ),
+                "metadata_completeness_mean": round(
+                    sum(float(finding.get("metadata_completeness") or 0.0) for finding in findings) / len(findings),
+                    3,
+                ) if findings else None,
                 "raw_claim_count": raw_total,
             }
 
@@ -276,6 +281,10 @@ async def get_claim_statistics(
             "by_section": by_section,
             "confidence_statistics": confidence_stats,
             "normalization_quality_percentage": round((canonical_count / raw_total) * 100, 1) if raw_total > 0 else 0,
+            "metadata_completeness_mean": round(
+                sum(claim_metadata_completeness(claim) for claim in claims) / len(claims),
+                3,
+            ) if claims else None,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to compute statistics: {str(e)}")
@@ -488,14 +497,7 @@ def _build_evidence_cluster(
         "best_evidence_type": _get_best_evidence_type(claims),
         "evidence_gaps": _extract_evidence_gaps(claims, intervention_canonical, outcome_canonical),
         "claims_summary": [
-            {
-                "id": str(claim.id),
-                "statement": claim.statement_raw,
-                "direction": claim_direction_value(claim),
-                "confidence": round(claim.composite_confidence, 3),
-                "paper_title": claim.paper_title or "Unknown",
-                "claim_type": claim_type_value(claim),
-            }
+            _cluster_claim_summary(claim)
             for claim in claims
         ]
     }
@@ -529,6 +531,7 @@ def _extract_evidence_gaps(
 ) -> List[dict]:
     """Extract evidence gaps for a cluster."""
     gaps = []
+    claim_summaries = [_cluster_claim_summary(claim) for claim in claims]
     
     # Gap 1: Limited evidence
     if len(claims) < 3:
@@ -536,6 +539,11 @@ def _extract_evidence_gaps(
             "type": "limited_evidence",
             "description": f"Only {len(claims)} claim(s) found for this intervention/outcome pair",
             "severity": "medium",
+            "details": [
+                "Open this gap to inspect the specific claim records currently supporting this cluster.",
+            ],
+            "related_claim_ids": [str(claim.id) for claim in claims],
+            "related_claims": claim_summaries,
         })
     
     # Gap 2: Study design diversity
@@ -545,6 +553,11 @@ def _extract_evidence_gaps(
             "type": "study_design_homogeneity",
             "description": "Limited diversity in study designs",
             "severity": "low",
+            "details": [
+                f"Study designs seen: {', '.join(sorted(study_designs))}" if study_designs else "No study design metadata was recorded for these claims.",
+            ],
+            "related_claim_ids": [str(claim.id) for claim in claims],
+            "related_claims": claim_summaries,
         })
     
     # Gap 3: Population coverage
@@ -554,18 +567,46 @@ def _extract_evidence_gaps(
             "type": "population_coverage",
             "description": "Limited population diversity",
             "severity": "low",
+            "details": [
+                f"Populations seen: {', '.join(sorted(populations))}" if populations else "No explicit population labels were recorded for these claims.",
+            ],
+            "related_claim_ids": [str(claim.id) for claim in claims],
+            "related_claims": claim_summaries,
         })
     
     # Gap 4: Contradictory evidence
     directions = set(claim_direction_value(c) for c in claims)
     if len(directions) > 1 and 'positive' in directions and 'negative' in directions:
+        conflicting_claims = [
+            claim for claim in claims
+            if claim_direction_value(claim) in {"positive", "negative"}
+        ]
         gaps.append({
             "type": "conflicting_evidence",
             "description": "Contradictory findings exist",
             "severity": "high",
+            "details": [
+                f"This cluster includes both positive and negative claims about {intervention_canonical} and {outcome_canonical}.",
+            ],
+            "related_claim_ids": [str(claim.id) for claim in conflicting_claims],
+            "related_claims": [_cluster_claim_summary(claim) for claim in conflicting_claims],
         })
     
     return gaps
+
+
+def _cluster_claim_summary(claim: ResearchClaim) -> dict:
+    return {
+        "id": str(claim.id),
+        "statement": claim.statement_raw,
+        "direction": claim_direction_value(claim),
+        "confidence": round(claim.composite_confidence, 3),
+        "paper_title": claim.paper_title or "Unknown",
+        "claim_type": claim_type_value(claim),
+        "section_source": claim.section_source,
+        "study_design": claim.study_design,
+        "doi_or_url": claim.doi_or_url,
+    }
 
 
 def _format_claim_detailed(claim: ResearchClaim) -> dict:

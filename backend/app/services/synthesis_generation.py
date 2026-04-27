@@ -27,7 +27,13 @@ from app.models import (
 )
 from app.models.memory import MemoryEventType
 from app.models.belief_revision import DriftTrendEnum, RevisionTypeEnum
-from app.services.claim_curation import claim_direction_value
+from app.services.claim_curation import (
+    claim_direction_value,
+    claim_metadata_completeness,
+    claim_topic_key,
+    collapse_claims_to_findings,
+    select_representative_claim,
+)
 from app.services.llm import get_llm_provider
 from app.services.memory_system import MemorySystemService
 
@@ -96,6 +102,23 @@ def _recency_weight(year: Optional[int]) -> float:
 
 def _word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
+
+
+def _token_overlap_ratio(left: Any, right: Any) -> float:
+    left_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(left or "").lower())
+        if len(token) > 2
+    }
+    right_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(right or "").lower())
+        if len(token) > 2
+    }
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens.intersection(right_tokens))
+    return round(overlap / max(len(right_tokens), 1), 4)
 
 
 def _jsonable(value: Any) -> Any:
@@ -318,10 +341,19 @@ class SynthesisGenerationService:
             )
         ).scalar_one_or_none()
 
-        primary_pair, primary_claims = self._select_primary_cluster(claims)
-        ranked_claims = sorted(primary_claims[:20], key=lambda claim: self._evidence_score(claim), reverse=True)
+        focus_clusters, ranked_claims = self._select_focus_clusters(mission, claims)
+        primary_cluster = focus_clusters[0] if focus_clusters else {
+            "intervention": "mission evidence",
+            "outcome": "overall outcome",
+            "priority_score": 0.0,
+            "mission_affinity": 0.0,
+            "claim_count": 0,
+        }
         tier1, tier2, tier3 = self._partition_tiers(ranked_claims)
-        contradictions = await self._load_contradictions(mission.id, primary_pair)
+        contradictions = await self._load_contradictions(
+            mission.id,
+            [(cluster["intervention"], cluster["outcome"]) for cluster in focus_clusters],
+        )
         refinements = await self._load_refinements(mission.id, [claim.id for claim in ranked_claims])
         drift_trend = _enum_value(getattr(belief_state, "drift_trend", None), DriftTrendEnum.STABILIZING.value)
         dominant_direction = _enum_value(getattr(belief_state, "dominant_evidence_direction", None), "mixed") or "mixed"
@@ -345,7 +377,11 @@ class SynthesisGenerationService:
             "revision_type": _enum_value(getattr(latest_revision, "revision_type", None), "NO_UPDATE"),
             "drift_trend": drift_trend,
             "cycle_number": int(getattr(belief_state, "last_cycle_number", None) or mission.session_count or 0),
-            "primary_pair": {"intervention": primary_pair[0], "outcome": primary_pair[1]},
+            "primary_pair": {
+                "intervention": primary_cluster["intervention"],
+                "outcome": primary_cluster["outcome"],
+            },
+            "focus_clusters": focus_clusters,
             "tier1": [self._claim_payload(claim) for claim in tier1],
             "tier2": [self._claim_payload(claim) for claim in tier2],
             "tier3": [self._claim_payload(claim) for claim in tier3],
@@ -356,10 +392,15 @@ class SynthesisGenerationService:
             "contradictions": contradictions,
             "subgroups_and_refinements": refinements,
             "paper_count": len({str(claim.paper_id) for claim in ranked_claims}),
+            "evidence_claim_pool_count": len(ranked_claims),
             "confidence_tier": confidence_tier,
         }
 
-    def _select_primary_cluster(self, claims: Sequence[ResearchClaim]) -> Tuple[Tuple[str, str], List[ResearchClaim]]:
+    def _select_focus_clusters(
+        self,
+        mission: Mission,
+        claims: Sequence[ResearchClaim],
+    ) -> Tuple[List[Dict[str, Any]], List[ResearchClaim]]:
         grouped: Dict[Tuple[str, str], List[ResearchClaim]] = {}
         for claim in claims:
             intervention = (claim.intervention_canonical or claim.intervention or "").strip()
@@ -372,19 +413,102 @@ class SynthesisGenerationService:
             fallback = list(claims[:20])
             top = fallback[0] if fallback else None
             return (
-                (
-                    (top.intervention_canonical or top.intervention or "mission evidence") if top else "mission evidence",
-                    (top.outcome_canonical or top.outcome or "overall outcome") if top else "overall outcome",
-                ),
+                [
+                    {
+                        "intervention": (top.intervention_canonical or top.intervention or "mission evidence") if top else "mission evidence",
+                        "outcome": (top.outcome_canonical or top.outcome or "overall outcome") if top else "overall outcome",
+                        "priority_score": 0.0,
+                        "mission_affinity": 0.0,
+                        "claim_count": len(fallback),
+                    }
+                ],
                 fallback,
             )
 
-        def cluster_score(items: Sequence[ResearchClaim]) -> float:
-            return round(sum(self._evidence_score(claim) for claim in items), 6)
+        cluster_rows: List[Dict[str, Any]] = []
+        for pair, items in grouped.items():
+            collapsed = [select_representative_claim(group) for group in collapse_claims_to_findings(items)]
+            evidence_total = round(sum(self._evidence_score(claim) for claim in collapsed), 6)
+            mission_affinity = self._cluster_mission_affinity(mission, pair, collapsed)
+            priority_score = round(evidence_total * (0.55 + 0.45 * mission_affinity), 6)
+            cluster_rows.append(
+                {
+                    "pair": pair,
+                    "claims": sorted(collapsed, key=lambda claim: self._evidence_score(claim), reverse=True),
+                    "priority_score": priority_score,
+                    "mission_affinity": mission_affinity,
+                    "claim_count": len(collapsed),
+                }
+            )
 
-        primary_pair = max(grouped.items(), key=lambda item: (cluster_score(item[1]), len(item[1])))[0]
-        ranked = sorted(grouped[primary_pair], key=lambda claim: self._evidence_score(claim), reverse=True)
-        return primary_pair, ranked
+        cluster_rows.sort(
+            key=lambda item: (
+                -float(item["priority_score"]),
+                -float(item["mission_affinity"]),
+                -int(item["claim_count"]),
+                item["pair"][0],
+                item["pair"][1],
+            )
+        )
+
+        selected_clusters: List[Dict[str, Any]] = []
+        combined_claims: List[ResearchClaim] = []
+        seen_claim_ids: set[str] = set()
+
+        for cluster in cluster_rows:
+            if len(selected_clusters) >= 4:
+                break
+            if selected_clusters and len(combined_claims) >= 18 and len(selected_clusters) >= 2:
+                break
+
+            selected_clusters.append(
+                {
+                    "intervention": cluster["pair"][0],
+                    "outcome": cluster["pair"][1],
+                    "priority_score": round(float(cluster["priority_score"]), 4),
+                    "mission_affinity": round(float(cluster["mission_affinity"]), 4),
+                    "claim_count": int(cluster["claim_count"]),
+                }
+            )
+            for claim in cluster["claims"][:6]:
+                claim_id = str(claim.id)
+                if claim_id in seen_claim_ids:
+                    continue
+                seen_claim_ids.add(claim_id)
+                combined_claims.append(claim)
+
+        ranked = sorted(combined_claims, key=lambda claim: self._evidence_score(claim), reverse=True)
+        return selected_clusters, ranked[:24]
+
+    def _cluster_mission_affinity(
+        self,
+        mission: Mission,
+        pair: Tuple[str, str],
+        claims: Sequence[ResearchClaim],
+    ) -> float:
+        mission_intervention = getattr(mission, "pico_intervention", None) or mission.normalized_query or ""
+        mission_outcome = getattr(mission, "pico_outcome", None) or mission.normalized_query or ""
+        intervention_overlap = _token_overlap_ratio(pair[0], mission_intervention)
+        outcome_overlap = _token_overlap_ratio(pair[1], mission_outcome)
+        text_overlap = max(
+            (
+                max(
+                    _token_overlap_ratio(_claim_statement(claim), mission_intervention),
+                    _token_overlap_ratio(_claim_statement(claim), mission_outcome),
+                )
+                for claim in claims
+            ),
+            default=0.0,
+        )
+        avg_relevance = sum(_mission_relevance_weight(claim) for claim in claims) / max(len(claims), 1)
+        normalized_relevance = max(0.0, min(1.0, (avg_relevance - 0.4) / 0.6))
+        affinity = (
+            (0.25 * intervention_overlap)
+            + (0.45 * outcome_overlap)
+            + (0.15 * text_overlap)
+            + (0.15 * normalized_relevance)
+        )
+        return round(max(0.0, min(1.0, affinity)), 4)
 
     def _partition_tiers(
         self,
@@ -393,8 +517,14 @@ class SynthesisGenerationService:
         if not claims:
             return [], [], []
         total = len(claims)
-        tier1_end = max(1, math.ceil(total * 0.4))
-        tier2_end = max(tier1_end + 1, math.ceil(total * 0.8))
+        if total == 1:
+            return [claims[0]], [], []
+        if total == 2:
+            return [claims[0]], [claims[1]], []
+        if total <= 4:
+            return list(claims[:2]), list(claims[2:]), []
+        tier1_end = min(total, max(3, math.ceil(total * 0.35)))
+        tier2_end = min(total, max(tier1_end + 2, math.ceil(total * 0.75)))
         return (list(claims[:tier1_end]), list(claims[tier1_end:tier2_end]), list(claims[tier2_end:]))
 
     def _evidence_score(self, claim: ResearchClaim) -> float:
@@ -404,6 +534,7 @@ class SynthesisGenerationService:
                 * float(claim.study_design_score or 0.0)
                 * _recency_weight(_publication_year(claim))
                 * _mission_relevance_weight(claim)
+                * max(0.55, claim_metadata_completeness(claim))
             )
         except (TypeError, ValueError):
             score = 0.0
@@ -412,7 +543,7 @@ class SynthesisGenerationService:
     async def _load_contradictions(
         self,
         mission_id: str,
-        primary_pair: Tuple[str, str],
+        focus_pairs: Sequence[Tuple[str, str]],
     ) -> List[Dict[str, Any]]:
         rows = (
             await self.db.execute(
@@ -460,10 +591,11 @@ class SynthesisGenerationService:
             if severity_rank[severity] < severity_rank[group["highest_severity"]]:
                 group["highest_severity"] = severity
 
+        focus_pair_set = set(focus_pairs)
         prioritized = sorted(
             grouped.values(),
             key=lambda item: (
-                0 if (item["intervention_canonical"], item["outcome_canonical"]) == primary_pair else 1,
+                0 if (item["intervention_canonical"], item["outcome_canonical"]) in focus_pair_set else 1,
                 severity_rank.get(item["highest_severity"], 3),
                 -float(item["max_confidence_product"] or 0.0),
                 -int(item["pair_count"] or 0),
@@ -577,6 +709,7 @@ class SynthesisGenerationService:
             "tier_1_claims": evidence_package["tier1"],
             "tier_2_claims": evidence_package["tier2"],
             "tier_3_claims": evidence_package["tier3"],
+            "focus_clusters": evidence_package["focus_clusters"],
             "high_severity_contradictions": [item for item in evidence_package["contradictions"] if item["severity"] == "HIGH"],
             "medium_severity_contradictions": [item for item in evidence_package["contradictions"] if item["severity"] == "MEDIUM"],
             "low_severity_contradictions": [item for item in evidence_package["contradictions"] if item["severity"] == "LOW"],
@@ -720,6 +853,11 @@ class SynthesisGenerationService:
         confidence_pct = round(evidence_package["current_confidence"] * 100)
         contradictions = [item for item in evidence_package["contradictions"] if item["severity"] == "HIGH"]
         limitation = self._primary_limitation(evidence_package)
+        focus_clusters = evidence_package.get("focus_clusters") or []
+        focus_cluster_labels = ", ".join(
+            f"{cluster['intervention']} / {cluster['outcome']}"
+            for cluster in focus_clusters[:3]
+        ) or f"{evidence_package['primary_pair']['intervention']} / {evidence_package['primary_pair']['outcome']}"
         confidence_lead = {
             "STRONG": "strongly supports the current conclusion",
             "MODERATE": "generally supports the current conclusion",
@@ -735,9 +873,9 @@ class SynthesisGenerationService:
             f"Based on {claim_count} claims from {paper_count} papers, the current evidence {confidence_lead} "
             f"for the research question: {evidence_package['mission_question']}. "
             f"The dominant evidence direction is {direction}, and the current confidence score is {confidence_pct}%.{contradiction_note}\n\n"
-            f"The highest-weighted evidence cluster centers on {evidence_package['primary_pair']['intervention']} and "
-            f"{evidence_package['primary_pair']['outcome']}, with Tier 1 findings carrying the most influence on the current synthesis. "
-            f"Supporting and peripheral claims were considered but weighted less heavily according to study design, recency, and mission relevance.\n\n"
+            f"The strongest evidence clusters center on {focus_cluster_labels}, "
+            f"with Tier 1 findings carrying the most influence on the current synthesis. "
+            f"Supporting and peripheral claims were considered across {len(focus_clusters) or 1} mission-aligned clusters and weighted according to study design, recency, and mission relevance.\n\n"
             f"Uncertainty remains because {limitation}. "
             f"Subgroup and refinement evidence was retained as qualification context rather than treated as a separate conclusion.\n\n"
             "This synthesis was generated from structured evidence directly because the narrative generation path did not pass validation."
@@ -866,6 +1004,8 @@ class SynthesisGenerationService:
                 "tier1_count": len(row.claim_ids_tier1 or []),
                 "tier2_count": len(row.claim_ids_tier2 or []),
                 "tier3_count": len(row.claim_ids_tier3 or []),
+                "focus_cluster_count": len(evidence_package.get("focus_clusters") or []),
+                "evidence_claim_pool_count": int(evidence_package.get("evidence_claim_pool_count") or len(row.claim_ids_used or [])),
                 "high_contradictions": sum(1 for item in contradiction_details if item.get("severity") == "HIGH"),
                 "medium_contradictions": sum(1 for item in contradiction_details if item.get("severity") == "MEDIUM"),
                 "high_contradiction_pairs": sum(len(item.get("contradiction_ids") or []) for item in contradiction_details if item.get("severity") == "HIGH"),
@@ -882,7 +1022,7 @@ class SynthesisGenerationService:
         return (
             f"Synthesis v{record.version_number} generated with {record.confidence_tier} confidence "
             f"and {record.change_magnitude} change magnitude. "
-            f"Primary cluster: {evidence_package['primary_pair']['intervention']} -> {evidence_package['primary_pair']['outcome']}."
+            f"Focus clusters: {len(evidence_package.get('focus_clusters') or [])}, led by {evidence_package['primary_pair']['intervention']} -> {evidence_package['primary_pair']['outcome']}."
         )
 
     def _major_change_description(self, change: Dict[str, Any], evidence_package: Dict[str, Any]) -> str:

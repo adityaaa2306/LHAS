@@ -118,6 +118,9 @@ export interface EvidenceGap {
   type: EvidenceGapType;
   description: string;
   severity: GapSeverity;
+  details?: string[] | null;
+  related_claim_ids?: string[];
+  related_claims?: ClaimSummary[];
 }
 
 export interface ClaimSummary {
@@ -127,6 +130,9 @@ export interface ClaimSummary {
   confidence: number;
   paper_title: string;
   claim_type: string;
+  section_source?: string | null;
+  study_design?: string | null;
+  doi_or_url?: string | null;
 }
 
 export interface EvidenceCluster {
@@ -213,6 +219,7 @@ export interface MemoryContradiction {
   claim_b_statement?: string | null;
   claim_a_paper_title?: string | null;
   claim_b_paper_title?: string | null;
+  plain_language_summary?: string | null;
 }
 
 export interface MemoryOverview {
@@ -220,6 +227,7 @@ export interface MemoryOverview {
   latest_snapshot: MissionSnapshot | null;
   latest_drift: DriftMetric | null;
   belief_state?: {
+    current_belief_statement?: string | null;
     current_confidence_score: number | null;
     dominant_evidence_direction: string | null;
     current_revision_type: string | null;
@@ -414,6 +422,11 @@ export interface ConfirmedContradiction {
   study_design_delta: number;
   recency_weight: number | null;
   justification: string | null;
+  claim_a_statement?: string | null;
+  claim_b_statement?: string | null;
+  claim_a_paper_title?: string | null;
+  claim_b_paper_title?: string | null;
+  plain_language_summary?: string | null;
 }
 
 export interface ContextResolvedPair {
@@ -492,6 +505,8 @@ export interface SynthesisVersion {
     tier1_count: number;
     tier2_count: number;
     tier3_count: number;
+    focus_cluster_count?: number;
+    evidence_claim_pool_count?: number;
     high_contradictions: number;
     medium_contradictions: number;
     high_contradiction_pairs?: number;

@@ -2,7 +2,9 @@ import React from 'react';
 import { AlertTriangle, CheckCircle2, HelpCircle, ShieldAlert } from 'lucide-react';
 
 import { apiClient } from '@/services/api';
+import { ClaimSourceModal } from '@/components/ClaimSourceModal';
 import { ScrollFadePanel } from '@/components/ScrollFadePanel';
+import { describeContradictionTopic } from '@/utils/missionNarratives';
 import type {
   AmbiguousContradictionPair,
   ConfirmedContradiction,
@@ -21,6 +23,8 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
   const [ambiguous, setAmbiguous] = React.useState<AmbiguousContradictionPair[]>([]);
   const [showConfirmedList, setShowConfirmedList] = React.useState(false);
   const [showConfirmedModal, setShowConfirmedModal] = React.useState(false);
+  const [selectedTopicKey, setSelectedTopicKey] = React.useState<string | null>(null);
+  const [selectedClaimId, setSelectedClaimId] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -40,6 +44,7 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
         maxWeight: number | null;
         directionCounts: Record<string, number>;
         claimIds: Set<string>;
+        items: ConfirmedContradiction[];
       }
     >();
 
@@ -61,6 +66,7 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
           maxWeight: item.edge_weight ?? null,
           directionCounts: {},
           claimIds: new Set<string>(),
+          items: [],
         });
       }
       const group = groups.get(key)!;
@@ -68,6 +74,7 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
       group.claimIds.add(item.claim_a_id);
       group.claimIds.add(item.claim_b_id);
       group.directionCounts[directionKey] = (group.directionCounts[directionKey] || 0) + 1;
+      group.items.push(item);
       if ((item.edge_weight ?? -1) > (group.maxWeight ?? -1)) {
         group.maxWeight = item.edge_weight ?? null;
       }
@@ -84,8 +91,28 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
         return severityRank[right.highestSeverity] - severityRank[left.highestSeverity];
       }
       return right.pairCount - left.pairCount;
+    }).map((item) => {
+      const directionSummary = Object.keys(item.directionCounts).join(', ');
+      return {
+        ...item,
+        claimCount: item.claimIds.size,
+        claimIds: new Set(item.claimIds),
+        directionSummary,
+        plainLanguageSummary: describeContradictionTopic({
+          intervention: item.intervention,
+          outcome: item.outcome,
+          pairCount: item.pairCount,
+          claimCount: item.claimIds.size,
+          directionSummary,
+        }),
+      };
     });
   }, [confirmed]);
+
+  const selectedTopic = React.useMemo(
+    () => groupedConfirmed.find((item) => item.key === selectedTopicKey) ?? null,
+    [groupedConfirmed, selectedTopicKey],
+  );
 
   React.useEffect(() => {
     let cancelled = false;
@@ -198,7 +225,12 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
               ) : undefined}
             >
               {groupedConfirmed.map((item) => (
-                <div key={item.key} className="rounded-xl border border-red-100 bg-red-50 p-3">
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setSelectedTopicKey(item.key)}
+                  className="w-full rounded-xl border border-red-100 bg-red-50 p-3 text-left transition hover:border-red-200 hover:bg-red-100/70"
+                >
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-sm font-semibold text-red-900">{item.highestSeverity}</span>
                     <span className="text-xs text-red-700">{item.maxWeight ? `${Math.round(item.maxWeight * 100)}% top weight` : 'Pending weight'}</span>
@@ -206,8 +238,9 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
                   <div className="mt-2 text-sm font-medium text-neutral-900">
                     {item.intervention} · {item.outcome}
                   </div>
+                  <p className="mt-2 text-sm text-red-950">{item.plainLanguageSummary}</p>
                   <div className="mt-1 text-xs text-neutral-600">
-                    {item.pairCount} confirmed pairs across {item.claimIds.size} claims
+                    {item.pairCount} confirmed pairs across {item.claimCount} claims
                   </div>
                   <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
                     {Object.entries(item.directionCounts).map(([directionKey, count]) => (
@@ -220,8 +253,9 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
                     {item.highSeverityCount > 0 && <span>{item.highSeverityCount} high</span>}
                     {item.mediumSeverityCount > 0 && <span>{item.mediumSeverityCount} medium</span>}
                     {item.lowSeverityCount > 0 && <span>{item.lowSeverityCount} low</span>}
+                    <span className="font-semibold text-red-700">Open details</span>
                   </div>
-                </div>
+                </button>
               ))}
             </ListCard>
 
@@ -261,9 +295,24 @@ export const ContradictionHandlingPanel: React.FC<ContradictionHandlingPanelProp
           title={`Confirmed contradiction pairs (${confirmed.length})`}
           subtitle={`${topicCount} contradiction topic${topicCount === 1 ? '' : 's'} are represented in this audit list.`}
           items={confirmed}
+          onOpenClaimSource={setSelectedClaimId}
           onClose={() => setShowConfirmedModal(false)}
         />
       )}
+
+      {selectedTopic && (
+        <ContradictionTopicModal
+          topic={selectedTopic}
+          onOpenClaimSource={setSelectedClaimId}
+          onClose={() => setSelectedTopicKey(null)}
+        />
+      )}
+
+      <ClaimSourceModal
+        claimId={selectedClaimId}
+        open={selectedClaimId !== null}
+        onClose={() => setSelectedClaimId(null)}
+      />
     </div>
   );
 };
@@ -319,7 +368,10 @@ const ListCard: React.FC<{
   );
 };
 
-const ConfirmedPairCard: React.FC<{ item: ConfirmedContradiction }> = ({ item }) => (
+const ConfirmedPairCard: React.FC<{
+  item: ConfirmedContradiction;
+  onOpenClaimSource?: (claimId: string) => void;
+}> = ({ item, onOpenClaimSource }) => (
   <div className="rounded-xl border border-red-100 bg-red-50 p-3">
     <div className="flex items-center justify-between gap-3">
       <span className="text-xs font-semibold text-red-900">{item.severity}</span>
@@ -333,9 +385,34 @@ const ConfirmedPairCard: React.FC<{ item: ConfirmedContradiction }> = ({ item })
     <div className="mt-1 text-xs text-neutral-600">
       {item.direction_a} vs {item.direction_b} · population {item.population_overlap}
     </div>
+    {item.plain_language_summary && (
+      <p className="mt-2 text-sm text-red-950">{item.plain_language_summary}</p>
+    )}
     <div className="mt-2 text-xs text-neutral-500">
       quality delta {item.quality_parity_delta.toFixed(2)} · confidence product {item.confidence_product.toFixed(2)}
     </div>
+    {item.claim_a_statement && item.claim_b_statement && (
+      <div className="mt-3 grid gap-2 lg:grid-cols-2">
+        <button
+          type="button"
+          onClick={() => item.claim_a_id && onOpenClaimSource?.(item.claim_a_id)}
+          className="rounded-xl border border-white/80 bg-white/85 px-3 py-3 text-left transition hover:border-red-200 hover:bg-white"
+        >
+          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Claim A</p>
+          <p className="mt-1 text-sm text-neutral-900">{item.claim_a_statement}</p>
+          {item.claim_a_paper_title && <p className="mt-2 text-xs text-neutral-500">{item.claim_a_paper_title}</p>}
+        </button>
+        <button
+          type="button"
+          onClick={() => item.claim_b_id && onOpenClaimSource?.(item.claim_b_id)}
+          className="rounded-xl border border-white/80 bg-white/85 px-3 py-3 text-left transition hover:border-red-200 hover:bg-white"
+        >
+          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Claim B</p>
+          <p className="mt-1 text-sm text-neutral-900">{item.claim_b_statement}</p>
+          {item.claim_b_paper_title && <p className="mt-2 text-xs text-neutral-500">{item.claim_b_paper_title}</p>}
+        </button>
+      </div>
+    )}
     {item.justification && (
       <div className="mt-2 text-xs text-red-800">{item.justification}</div>
     )}
@@ -346,8 +423,9 @@ const ContradictionListModal: React.FC<{
   title: string;
   subtitle: string;
   items: ConfirmedContradiction[];
+  onOpenClaimSource: (claimId: string) => void;
   onClose: () => void;
-}> = ({ title, subtitle, items, onClose }) => (
+}> = ({ title, subtitle, items, onOpenClaimSource, onClose }) => (
   <>
     <div className="fixed inset-0 z-40 bg-black/50" onClick={onClose} />
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -368,7 +446,63 @@ const ContradictionListModal: React.FC<{
         <ScrollFadePanel heightClassName="h-[70vh]" className="bg-neutral-50/50">
           <div className="space-y-3 p-5 pb-8">
             {items.map((item) => (
-              <ConfirmedPairCard key={item.id} item={item} />
+              <ConfirmedPairCard key={item.id} item={item} onOpenClaimSource={onOpenClaimSource} />
+            ))}
+          </div>
+        </ScrollFadePanel>
+      </div>
+    </div>
+  </>
+);
+
+const ContradictionTopicModal: React.FC<{
+  topic: {
+    key: string;
+    intervention: string;
+    outcome: string;
+    highestSeverity: 'LOW' | 'MEDIUM' | 'HIGH';
+    pairCount: number;
+    claimCount: number;
+    directionSummary: string;
+    plainLanguageSummary: string;
+    items: ConfirmedContradiction[];
+  };
+  onOpenClaimSource: (claimId: string) => void;
+  onClose: () => void;
+}> = ({ topic, onOpenClaimSource, onClose }) => (
+  <>
+    <div className="fixed inset-0 z-40 bg-black/50" onClick={onClose} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="max-h-[88vh] w-full max-w-5xl overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.22)]">
+        <div className="flex items-center justify-between border-b border-neutral-200 px-5 py-4">
+          <div>
+            <h3 className="text-lg font-semibold text-neutral-950">
+              {topic.intervention} Â· {topic.outcome}
+            </h3>
+            <p className="text-sm text-neutral-500">
+              {topic.pairCount} confirmed pair{topic.pairCount === 1 ? '' : 's'} across {topic.claimCount} claim{topic.claimCount === 1 ? '' : 's'}.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50"
+          >
+            Close
+          </button>
+        </div>
+        <ScrollFadePanel heightClassName="h-[70vh]" className="bg-neutral-50/50">
+          <div className="space-y-4 p-5 pb-8">
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-4">
+              <div className="mb-2 flex items-center gap-2">
+                <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-red-700">{topic.highestSeverity}</span>
+                <span className="text-xs text-red-700">{topic.directionSummary}</span>
+              </div>
+              <p className="text-sm leading-7 text-red-950">{topic.plainLanguageSummary}</p>
+            </div>
+
+            {topic.items.map((item) => (
+              <ConfirmedPairCard key={item.id} item={item} onOpenClaimSource={onOpenClaimSource} />
             ))}
           </div>
         </ScrollFadePanel>

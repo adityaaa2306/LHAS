@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 
 import { apiClient } from '../services/api';
+import { ClaimSourceModal } from './ClaimSourceModal';
 import { ScrollFadePanel } from './ScrollFadePanel';
 import type { ClaimSummary, ClusterResponse, EvidenceCluster } from '../types';
 
@@ -32,6 +33,7 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
   const [sortBy, setSortBy] = useState<SortBy>('confidence');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedClusterId, setExpandedClusterId] = useState<string | null>(null);
+  const [selectedClaimId, setSelectedClaimId] = useState<string | null>(null);
 
   useEffect(() => {
     void loadClusters();
@@ -142,13 +144,20 @@ export const ClaimsExplorer: React.FC<ClaimsExplorerProps> = ({ missionId }) => 
               clusters={filteredClusters}
               expandedClusterId={expandedClusterId}
               onExpandChange={setExpandedClusterId}
+              onOpenClaimSource={setSelectedClaimId}
             />
           )}
 
-          {viewMode === 'conflicts' && <ConflictsView clusters={filteredClusters} />}
+          {viewMode === 'conflicts' && <ConflictsView clusters={filteredClusters} onOpenClaimSource={setSelectedClaimId} />}
           {viewMode === 'entities' && <EntitiesView clusters={clusters} />}
         </ScrollFadePanel>
       </div>
+
+      <ClaimSourceModal
+        claimId={selectedClaimId}
+        open={selectedClaimId !== null}
+        onClose={() => setSelectedClaimId(null)}
+      />
     </div>
   );
 };
@@ -260,12 +269,14 @@ interface ClustersViewProps {
   clusters: EvidenceCluster[];
   expandedClusterId: string | null;
   onExpandChange: (id: string | null) => void;
+  onOpenClaimSource: (claimId: string) => void;
 }
 
 const ClustersView: React.FC<ClustersViewProps> = ({
   clusters,
   expandedClusterId,
   onExpandChange,
+  onOpenClaimSource,
 }) => {
   if (clusters.length === 0) {
     return <EmptyState icon={BarChart3} title="No evidence clusters" description="Start by extracting claims from papers to see clustered evidence." />;
@@ -284,7 +295,7 @@ const ClustersView: React.FC<ClustersViewProps> = ({
             className="overflow-hidden rounded-[18px] border border-neutral-200/90 bg-white shadow-[0_10px_24px_rgba(15,23,42,0.045)] transition hover:-translate-y-[1px] hover:shadow-[0_16px_32px_rgba(15,23,42,0.07)]"
           >
             <ClusterRow cluster={cluster} isExpanded={isExpanded} onToggleExpand={() => onExpandChange(isExpanded ? null : clusterId)} />
-            {isExpanded && <ExpandedClusterDetail cluster={cluster} />}
+            {isExpanded && <ExpandedClusterDetail cluster={cluster} onOpenClaimSource={onOpenClaimSource} />}
           </div>
         );
       })}
@@ -510,7 +521,12 @@ const StatusBadge: React.FC<{ tone: 'conflict' | 'warning' | 'neutral'; label: s
   );
 };
 
-const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster }> = ({ cluster }) => {
+const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster; onOpenClaimSource: (claimId: string) => void }> = ({
+  cluster,
+  onOpenClaimSource,
+}) => {
+  const [expandedGapId, setExpandedGapId] = React.useState<string | null>(null);
+
   return (
     <div className="border-t border-neutral-200 bg-neutral-50/80 px-5 py-5">
       <div className="grid gap-5 xl:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
@@ -518,7 +534,7 @@ const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster }> = ({ cluster
           <SectionTitle icon={FileText} color="text-blue-600" title={`Claims in cluster (${cluster.claims_summary.length})`} />
           <div className="mt-4 space-y-3">
             {cluster.claims_summary.map((claim, idx) => (
-              <ClaimRowDetail key={`${claim.id}-${idx}`} claim={claim} />
+              <ClaimRowDetail key={`${claim.id}-${idx}`} claim={claim} onOpenClaimSource={onOpenClaimSource} />
             ))}
           </div>
         </div>
@@ -548,8 +564,52 @@ const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster }> = ({ cluster
               <SectionTitle icon={Zap} color="text-amber-600" title={`Evidence gaps (${cluster.evidence_gaps.length})`} compact />
               <div className="mt-3 space-y-2">
                 {cluster.evidence_gaps.map((gap, idx) => (
-                  <div key={`${gap.type}-${idx}`} className="rounded-2xl bg-white/70 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-100">
-                    {gap.description}
+                  <div key={`${gap.type}-${idx}`} className="rounded-2xl border border-amber-100 bg-white/80 shadow-sm">
+                    <button
+                      type="button"
+                      onClick={() => setExpandedGapId((current) => (current === `${gap.type}-${idx}` ? null : `${gap.type}-${idx}`))}
+                      className="w-full px-3 py-2 text-left text-sm text-amber-900"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <span>{gap.description}</span>
+                        {expandedGapId === `${gap.type}-${idx}` ? (
+                          <ChevronUp className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700" />
+                        ) : (
+                          <ChevronDown className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700" />
+                        )}
+                      </div>
+                    </button>
+                    {expandedGapId === `${gap.type}-${idx}` && (
+                      <div className="border-t border-amber-100 px-3 py-3">
+                        {gap.details && gap.details.length > 0 && (
+                          <div className="space-y-1 text-xs text-amber-900">
+                            {gap.details.map((detail, detailIdx) => (
+                              <p key={`${gap.type}-detail-${detailIdx}`}>{detail}</p>
+                            ))}
+                          </div>
+                        )}
+                        {gap.related_claims && gap.related_claims.length > 0 && (
+                          <div className="mt-3 space-y-2">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-700">
+                              Related claims
+                            </p>
+                            {gap.related_claims.map((claim) => (
+                              <button
+                                key={`${gap.type}-${claim.id}`}
+                                type="button"
+                                onClick={() => onOpenClaimSource(claim.id)}
+                                className="w-full rounded-2xl border border-amber-100 bg-white px-3 py-3 text-left transition hover:border-amber-200 hover:bg-amber-50/50"
+                              >
+                                <p className="text-sm font-medium text-neutral-900">{claim.statement}</p>
+                                <p className="mt-2 text-xs text-neutral-600">
+                                  {claim.paper_title} • {Math.round(claim.confidence * 100)}% confidence
+                                </p>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -561,7 +621,10 @@ const ExpandedClusterDetail: React.FC<{ cluster: EvidenceCluster }> = ({ cluster
   );
 };
 
-const ClaimRowDetail: React.FC<{ claim: ClaimSummary }> = ({ claim }) => {
+const ClaimRowDetail: React.FC<{ claim: ClaimSummary; onOpenClaimSource: (claimId: string) => void }> = ({
+  claim,
+  onOpenClaimSource,
+}) => {
   const directionIcon =
     claim.direction === 'positive' ? (
       <TrendingUp className="h-4 w-4 text-emerald-600" />
@@ -572,7 +635,11 @@ const ClaimRowDetail: React.FC<{ claim: ClaimSummary }> = ({ claim }) => {
     );
 
   return (
-    <div className="rounded-[16px] border border-neutral-200 bg-white px-4 py-4 shadow-sm">
+    <button
+      type="button"
+      onClick={() => onOpenClaimSource(claim.id)}
+      className="w-full rounded-[16px] border border-neutral-200 bg-white px-4 py-4 text-left shadow-sm transition hover:border-blue-200 hover:bg-blue-50/30"
+    >
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-start gap-3">
           <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-neutral-50 ring-1 ring-neutral-200">
@@ -588,17 +655,22 @@ const ClaimRowDetail: React.FC<{ claim: ClaimSummary }> = ({ claim }) => {
               >
                 {claim.paper_title}
               </span>
+              <span className="text-neutral-300">•</span>
+              <span className="font-medium text-blue-700">Open source</span>
             </div>
           </div>
         </div>
 
         <ConfidenceBadge confidence={claim.confidence} />
       </div>
-    </div>
+    </button>
   );
 };
 
-const ConflictsView: React.FC<{ clusters: EvidenceCluster[] }> = ({ clusters }) => {
+const ConflictsView: React.FC<{ clusters: EvidenceCluster[]; onOpenClaimSource: (claimId: string) => void }> = ({
+  clusters,
+  onOpenClaimSource,
+}) => {
   if (clusters.length === 0) {
     return <EmptyState icon={AlertTriangle} title="No conflicts detected" description="The evidence is aligned across all visible clusters." />;
   }
@@ -631,8 +703,18 @@ const ConflictsView: React.FC<{ clusters: EvidenceCluster[] }> = ({ clusters }) 
                   </span>
                 </div>
                 <div className="grid gap-3 lg:grid-cols-2">
-                  <ConflictSourceCard title={pair.claim1_paper} direction={pair.claim1_direction} />
-                  <ConflictSourceCard title={pair.claim2_paper} direction={pair.claim2_direction} />
+                  <ConflictSourceCard
+                    title={pair.claim1_paper}
+                    direction={pair.claim1_direction}
+                    claimId={pair.claim1_id}
+                    onOpenClaimSource={onOpenClaimSource}
+                  />
+                  <ConflictSourceCard
+                    title={pair.claim2_paper}
+                    direction={pair.claim2_direction}
+                    claimId={pair.claim2_id}
+                    onOpenClaimSource={onOpenClaimSource}
+                  />
                 </div>
               </div>
             ))}
@@ -643,11 +725,20 @@ const ConflictsView: React.FC<{ clusters: EvidenceCluster[] }> = ({ clusters }) 
   );
 };
 
-const ConflictSourceCard: React.FC<{ title: string; direction: string }> = ({ title, direction }) => {
+const ConflictSourceCard: React.FC<{
+  title: string;
+  direction: string;
+  claimId: string;
+  onOpenClaimSource: (claimId: string) => void;
+}> = ({ title, direction, claimId, onOpenClaimSource }) => {
   const positive = direction === 'positive';
   const negative = direction === 'negative';
   return (
-    <div className="rounded-[14px] border border-white bg-white px-4 py-3 shadow-sm ring-1 ring-neutral-200/80">
+    <button
+      type="button"
+      onClick={() => onOpenClaimSource(claimId)}
+      className="rounded-[14px] border border-white bg-white px-4 py-3 text-left shadow-sm ring-1 ring-neutral-200/80 transition hover:border-blue-200 hover:bg-blue-50/30"
+    >
       <div className="mb-2 flex items-center gap-2">
         {positive ? (
           <TrendingUp className="h-4 w-4 text-emerald-600" />
@@ -661,7 +752,7 @@ const ConflictSourceCard: React.FC<{ title: string; direction: string }> = ({ ti
       <p className="text-sm font-medium leading-6 text-neutral-900" title={title}>
         {title}
       </p>
-    </div>
+    </button>
   );
 };
 

@@ -4,6 +4,7 @@ import { MoreVertical, Activity, AlertCircle, Trash2 } from 'lucide-react';
 import type { Mission } from '@/types';
 import { StatusPill } from './StatusPill';
 import { ConfidenceSparkline } from './ConfidenceSparkline';
+import { ExpandableText } from './ExpandableText';
 
 interface MissionCardProps {
   mission: Mission;
@@ -107,7 +108,16 @@ export const MissionCard: React.FC<MissionCardProps> = ({ mission, onClick, onMe
 
       {/* Query line */}
       <div className="px-4 py-2 bg-white border-b border-neutral-200">
-        <p className="text-xs text-neutral-500 line-clamp-2">{mission.normalized_query}</p>
+        <ExpandableText
+          text={mission.normalized_query}
+          collapsedLines={2}
+          minCharactersToCollapse={110}
+          stopPropagation
+          textClassName="text-xs text-neutral-500 leading-5"
+          buttonClassName="text-[11px]"
+          expandLabel="Expand problem"
+          collapseLabel="Collapse problem"
+        />
       </div>
 
       {/* Intent badge + Status indicator */}

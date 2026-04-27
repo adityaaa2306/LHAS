@@ -27,11 +27,21 @@ from app.models import (
 )
 from app.models.belief_revision import ContradictionSeverityEnum
 from app.models.memory import MemoryEventType
-from app.services.claim_curation import claim_direction_value
+from app.services.claim_curation import (
+    claim_direction_value,
+    claim_metadata_completeness,
+    collapse_claims_to_findings,
+    select_representative_claim,
+)
 from app.services.llm import get_llm_provider
 from app.services.memory_system import MemorySystemService
 
 logger = logging.getLogger(__name__)
+
+PLACEHOLDER_BELIEF_TEXTS = {
+    "no evidence-backed belief has been formed yet.",
+    "no belief statement has been formed yet.",
+}
 
 
 class BeliefRevisionService:
@@ -423,7 +433,12 @@ class BeliefRevisionService:
             return state
 
         latest_snapshot = await self._latest_snapshot(mission.id)
-        statement = latest_snapshot["current_belief_statement"] if latest_snapshot else "No evidence-backed belief has been formed yet."
+        claims = await self._get_all_claims(mission.id)
+        statement = (
+            latest_snapshot["current_belief_statement"]
+            if latest_snapshot and not self._is_placeholder_belief_statement(latest_snapshot.get("current_belief_statement"))
+            else self._fallback_belief_statement(claims, None)
+        )
         confidence = float(
             (latest_snapshot["current_confidence_score"] if latest_snapshot else None)
             or mission.confidence_score
@@ -500,6 +515,15 @@ class BeliefRevisionService:
         query = query.order_by(ResearchClaim.extraction_timestamp.asc(), ResearchClaim.created_at.asc())
         return (await self.db.execute(query)).scalars().all()
 
+    async def _get_all_claims(self, mission_id: str) -> List[ResearchClaim]:
+        return (
+            await self.db.execute(
+                select(ResearchClaim)
+                .where(ResearchClaim.mission_id == mission_id)
+                .order_by(ResearchClaim.extraction_timestamp.asc(), ResearchClaim.created_at.asc())
+            )
+        ).scalars().all()
+
     async def _filter_incoming_claims(
         self,
         mission_id: str,
@@ -545,33 +569,39 @@ class BeliefRevisionService:
         claims: Sequence[ResearchClaim],
         contradiction_edges: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        direction_counts = Counter(claim_direction_value(claim) for claim in claims)
+        representative_claims = [select_representative_claim(group) for group in collapse_claims_to_findings(claims)]
+        working_claims = representative_claims or list(claims)
+        direction_counts = Counter(claim_direction_value(claim) for claim in working_claims)
         incoming_direction = "mixed"
-        if claims:
+        if working_claims:
             most_common_direction, count = direction_counts.most_common(1)[0]
-            if (count / len(claims)) > 0.70:
+            if (count / len(working_claims)) > 0.70:
                 incoming_direction = most_common_direction
 
         total_weight = 0.0
         weighted_confidence = 0.0
         best_study_design = 0.0
-        for claim in claims:
-            study_weight = max(float(claim.study_design_score or 0.0), 0.05)
+        for claim in working_claims:
+            study_weight = max(float(claim.study_design_score or 0.0), 0.05) * max(0.55, claim_metadata_completeness(claim))
             total_weight += study_weight
             weighted_confidence += float(claim.composite_confidence or 0.0) * study_weight
             best_study_design = max(best_study_design, float(claim.study_design_score or 0.0))
 
         incoming_weight = round((weighted_confidence / total_weight), 4) if total_weight else 0.0
-        claim_ids = {str(claim.id) for claim in claims}
+        claim_ids = {str(claim.id) for claim in working_claims}
         contradictions_in_batch = [
             edge for edge in contradiction_edges
             if claim_ids.intersection(edge.get("claim_ids") or {edge.get("claim_a_id"), edge.get("claim_b_id")})
         ]
-        top_claim = max(claims, key=lambda claim: float(claim.composite_confidence or 0.0)) if claims else None
+        top_claim = max(
+            working_claims,
+            key=lambda claim: (float(claim.composite_confidence or 0.0), claim_metadata_completeness(claim)),
+        ) if working_claims else None
         return {
             "incoming_direction": incoming_direction,
             "incoming_weight": incoming_weight,
-            "incoming_claim_count": len(claims),
+            "incoming_claim_count": len(working_claims),
+            "incoming_raw_claim_count": len(claims),
             "incoming_best_study_design": round(best_study_design, 4),
             "contradictions_in_batch": len(contradictions_in_batch),
             "contradiction_pairs_in_batch": sum(int(edge.get("pair_count") or 1) for edge in contradictions_in_batch),
@@ -1096,7 +1126,11 @@ class BeliefRevisionService:
             reasoning_type="belief_revision",
             premise=f"Cycle {revision_record.cycle_number} evidence was compared against the current belief state.",
             logic=revision_record.decision_rationale,
-            conclusion=f"{revision_record.revision_type.value} -> confidence {revision_record.new_confidence:.2f}, direction {revision_record.new_direction.value}.",
+            conclusion=self._reasoning_outcome_summary(
+                revision_record.revision_type,
+                revision_record.new_confidence,
+                revision_record.new_direction.value,
+            ),
             supporting_paper_ids=[],
             supporting_claims=revision_record.claims_considered[:10],
             confidence_score=revision_record.new_confidence,
@@ -1339,6 +1373,53 @@ class BeliefRevisionService:
         ).scalar_one()
         mission.active_alerts = int(active_count or 0)
 
+    def _is_placeholder_belief_statement(self, value: Optional[str]) -> bool:
+        normalized = str(value or "").strip().lower()
+        return not normalized or normalized in PLACEHOLDER_BELIEF_TEXTS
+
+    def _fallback_belief_statement(
+        self,
+        claims: Sequence[ResearchClaim],
+        new_direction: Optional[DominantDirection],
+        fallback_claim_text: Optional[str] = None,
+    ) -> str:
+        lead_claim = max(claims, key=lambda claim: float(claim.composite_confidence or 0.0)) if claims else None
+        lead_text = (lead_claim.statement_raw if lead_claim else fallback_claim_text) or ""
+        direction = new_direction or DominantDirection.MIXED
+
+        if direction == DominantDirection.POSITIVE:
+            return f"Current evidence leans positive. Leading finding: {lead_text}" if lead_text else "Current evidence leans positive."
+        if direction == DominantDirection.NEGATIVE:
+            return f"Current evidence leans negative. Leading finding: {lead_text}" if lead_text else "Current evidence leans negative."
+        if direction == DominantDirection.NULL:
+            return f"Current evidence suggests little clear effect. Leading finding: {lead_text}" if lead_text else "Current evidence suggests little clear effect."
+        return f"Current evidence is mixed. Leading finding: {lead_text}" if lead_text else "Current evidence is mixed."
+
+    def _reasoning_outcome_summary(
+        self,
+        revision_type: RevisionTypeEnum,
+        confidence: float,
+        direction: str,
+    ) -> str:
+        confidence_text = f"{round(float(confidence or 0.0) * 100)}% confidence"
+        direction_text = str(direction or "mixed").replace("_", " ")
+
+        if revision_type == RevisionTypeEnum.CONTRADICTION_PENALTY:
+            return f"A contradiction penalty lowered the mission to {confidence_text} while keeping the direction {direction_text}."
+        if revision_type == RevisionTypeEnum.NO_UPDATE:
+            return f"The belief stayed unchanged at {confidence_text} with a {direction_text} reading."
+        if revision_type in {RevisionTypeEnum.REINFORCE, RevisionTypeEnum.WEAK_REINFORCE}:
+            return f"The system reinforced the current belief to {confidence_text}, still leaning {direction_text}."
+        if revision_type == RevisionTypeEnum.WEAKEN:
+            return f"The system weakened the current belief to {confidence_text}, now reading as {direction_text}."
+        if revision_type == RevisionTypeEnum.MATERIAL_UPDATE:
+            return f"The system made a material update, ending at {confidence_text} with a {direction_text} direction."
+        if revision_type == RevisionTypeEnum.REVERSAL:
+            return f"The system reversed the prior belief and now leans {direction_text} at {confidence_text}."
+        if revision_type == RevisionTypeEnum.ESCALATE_FOR_REVIEW:
+            return "The system escalated this change for review before applying it automatically."
+        return f"The system updated the belief to {confidence_text} with a {direction_text} direction."
+
     def _compose_belief_statement(
         self,
         previous_statement: Optional[str],
@@ -1350,17 +1431,18 @@ class BeliefRevisionService:
         lead_claim = None
         if claims:
             lead_claim = max(claims, key=lambda claim: float(claim.composite_confidence or 0.0))
-        lead_text = (lead_claim.statement_raw if lead_claim else fallback_claim_text) or previous_statement or "No evidence-backed belief has been formed yet."
+        previous = None if self._is_placeholder_belief_statement(previous_statement) else previous_statement
+        lead_text = (lead_claim.statement_raw if lead_claim else fallback_claim_text) or previous
 
         if revision_type == RevisionTypeEnum.MATERIAL_UPDATE:
-            return f"Evidence is now mixed after a material update. Leading incoming finding: {lead_text}"
+            return f"Evidence is now mixed after a material update. Leading incoming finding: {lead_text}" if lead_text else "Evidence is now mixed after a material update."
         if revision_type == RevisionTypeEnum.REVERSAL:
-            return f"Belief direction reversed toward {new_direction.value}. Leading supporting finding: {lead_text}"
+            return f"Belief direction reversed toward {new_direction.value}. Leading supporting finding: {lead_text}" if lead_text else f"Belief direction reversed toward {new_direction.value}."
         if revision_type == RevisionTypeEnum.ESCALATE_FOR_REVIEW:
-            return previous_statement or f"Potential reversal toward {new_direction.value} is under review."
+            return previous or f"Potential reversal toward {new_direction.value} is under review."
         if revision_type == RevisionTypeEnum.NO_UPDATE:
-            return previous_statement or lead_text
-        return previous_statement or f"Current evidence trends {new_direction.value}. Highest-confidence finding: {lead_text}"
+            return previous or self._fallback_belief_statement(claims, new_direction, lead_text)
+        return previous or self._fallback_belief_statement(claims, new_direction, lead_text)
 
     def _timeline_title(self, revision_type: RevisionTypeEnum) -> str:
         return {

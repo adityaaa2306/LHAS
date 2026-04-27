@@ -31,7 +31,14 @@ from app.models import (
 )
 from app.models.belief_revision import RevisionTypeEnum
 from app.models.memory import MemoryEventType
-from app.services.claim_curation import claim_direction_value
+from app.services.claim_curation import (
+    claim_direction_value,
+    claim_metadata_completeness,
+    claim_publication_year,
+    claim_topic_key,
+    collapse_claims_to_findings,
+    select_representative_claim,
+)
 from app.services.embeddings import get_embedding_service
 from app.services.llm import get_llm_provider
 from app.services.memory_system import MemorySystemService
@@ -104,6 +111,10 @@ def _current_year() -> int:
 
 def _tokenize(text: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _normalized_title(text: Any) -> str:
+    return " ".join(str(text or "").strip().lower().split())
 
 
 def _text_similarity(left: str, right: str) -> float:
@@ -472,6 +483,7 @@ class AlignmentMonitoringService:
         belief_state: Optional[BeliefState],
     ) -> Dict[str, Any]:
         cluster_claims: List[ResearchClaim] = primary_cluster["claims"]
+        cluster_completeness = float(primary_cluster.get("metadata_completeness") or 0.0)
         dominant_direction = (
             _enum_value(getattr(belief_state, "dominant_evidence_direction", None), "mixed").lower()
             if belief_state
@@ -483,7 +495,7 @@ class AlignmentMonitoringService:
             matching = sum(1 for claim in cluster_claims if claim_direction_value(claim) == dominant_direction)
             support_ratio = round(matching / len(cluster_claims), 4)
             support_ratio_reliability = _reliability(
-                "high" if len(cluster_claims) >= 6 else "medium",
+                "high" if len(cluster_claims) >= 6 and cluster_completeness >= 0.75 else "medium",
                 "Primary evidence cluster contains enough directional claims for a stable support estimate.",
                 len(cluster_claims),
             )
@@ -505,6 +517,11 @@ class AlignmentMonitoringService:
             "has_high_quality_study": high_quality_present,
         }
         directional_retrieval_balance = None
+        paper_metadata_completeness = (
+            round(sum(self._raw_paper_metadata_completeness(row) for row in raw_papers[:20]) / len(raw_papers[:20]), 3)
+            if raw_papers[:20]
+            else None
+        )
         directional_retrieval_balance_reliability = _reliability(
             "insufficient",
             "Recent ingestion history is too sparse or direction is mixed, so retrieval balance is provisional.",
@@ -513,7 +530,7 @@ class AlignmentMonitoringService:
         if dominant_direction != "mixed" and len(raw_papers[:20]) >= 5:
             directional_retrieval_balance = self._directional_retrieval_balance(raw_papers, dominant_direction)
             directional_retrieval_balance_reliability = _reliability(
-                "high" if len(raw_papers[:20]) >= 10 else "medium",
+                "high" if len(raw_papers[:20]) >= 10 and float(paper_metadata_completeness or 0.0) >= 0.7 else "medium",
                 "Recent ingestion window is large enough to estimate directional retrieval balance.",
                 len(raw_papers[:20]),
             )
@@ -525,6 +542,8 @@ class AlignmentMonitoringService:
             "directional_retrieval_balance": directional_retrieval_balance,
             "directional_retrieval_balance_reliability": directional_retrieval_balance_reliability,
             "dominant_direction": dominant_direction,
+            "cluster_metadata_completeness": cluster_completeness if cluster_claims else None,
+            "paper_metadata_completeness": paper_metadata_completeness,
         }
 
     def _evidence_freshness_metrics(
@@ -535,13 +554,41 @@ class AlignmentMonitoringService:
         raw_papers: Sequence[RawPaperRecord],
         revisions: Sequence[BeliefRevisionRecord],
     ) -> Dict[str, Any]:
+        paper_year_by_id = {
+            str(paper.id): int(paper.year)
+            for paper in papers
+            if getattr(paper, "id", None) is not None and paper.year is not None
+        }
+        paper_year_by_title = {
+            _normalized_title(paper.title): int(paper.year)
+            for paper in papers
+            if paper.title and paper.year is not None
+        }
+        raw_year_by_research_paper_id = {
+            str(row.research_paper_id): int(row.publication_year)
+            for row in raw_papers
+            if getattr(row, "research_paper_id", None) is not None and row.publication_year is not None
+        }
+        raw_year_by_title = {
+            _normalized_title(row.title): int(row.publication_year)
+            for row in raw_papers
+            if row.title and row.publication_year is not None
+        }
         weighted_years: List[float] = []
         weighted_weights: List[float] = []
         for claim in claims:
-            year = self._claim_publication_year(claim)
+            year = claim_publication_year(claim)
+            if year is None and getattr(claim, "paper_id", None) is not None:
+                year = paper_year_by_id.get(str(claim.paper_id))
+            if year is None and getattr(claim, "paper_id", None) is not None:
+                year = raw_year_by_research_paper_id.get(str(claim.paper_id))
+            if year is None and getattr(claim, "paper_title", None):
+                year = paper_year_by_title.get(_normalized_title(claim.paper_title))
+            if year is None and getattr(claim, "paper_title", None):
+                year = raw_year_by_title.get(_normalized_title(claim.paper_title))
             if year is None:
                 continue
-            weight = max(0.05, _safe_float(claim.composite_confidence, 0.1))
+            weight = max(0.05, _safe_float(claim.composite_confidence, 0.1) * max(0.55, claim_metadata_completeness(claim)))
             weighted_years.append(float(year) * weight)
             weighted_weights.append(weight)
         mean_publication_year = (sum(weighted_years) / sum(weighted_weights)) if weighted_weights else None
@@ -587,7 +634,18 @@ class AlignmentMonitoringService:
             last_new_evidence_cycle = current_cycle if current_cycle else 0
 
         cluster_claims = sorted(primary_cluster["claims"], key=lambda claim: _safe_float(claim.composite_confidence), reverse=True)
-        top_years = [self._claim_publication_year(claim) or 0 for claim in cluster_claims[:3]]
+        top_years = []
+        for claim in cluster_claims[:3]:
+            year = claim_publication_year(claim)
+            if year is None and getattr(claim, "paper_id", None) is not None:
+                year = paper_year_by_id.get(str(claim.paper_id))
+            if year is None and getattr(claim, "paper_id", None) is not None:
+                year = raw_year_by_research_paper_id.get(str(claim.paper_id))
+            if year is None and getattr(claim, "paper_title", None):
+                year = paper_year_by_title.get(_normalized_title(claim.paper_title))
+            if year is None and getattr(claim, "paper_title", None):
+                year = raw_year_by_title.get(_normalized_title(claim.paper_title))
+            top_years.append(year or 0)
         recent_papers_exist = sum(1 for paper in papers if paper.year and (_current_year() - int(paper.year)) <= 3) >= 5
 
         return {
@@ -599,6 +657,7 @@ class AlignmentMonitoringService:
             "recency_inversion": bool(
                 recent_papers_exist and top_years and all(year and (_current_year() - year) > 10 for year in top_years)
             ),
+            "weighted_claim_year_count": len(weighted_weights),
         }
 
     def _revision_pattern_metrics(
@@ -873,7 +932,7 @@ class AlignmentMonitoringService:
             ),
             self._build_alert(
                 "SYNTHESIS_STAGNATION",
-                "MEDIUM" if contradictions["active_contradiction_count"] > 0 else "LOW",
+                "MEDIUM" if contradictions["active_contradiction_topic_count"] > 0 else "LOW",
                 synthesis["stagnation_window"] >= 8,
                 synthesis,
             ),
@@ -886,7 +945,7 @@ class AlignmentMonitoringService:
             self._build_alert(
                 "CONTRADICTION_BACKLOG",
                 "HIGH",
-                contradictions["active_contradiction_count"] > 5
+                contradictions["active_contradiction_topic_count"] > 1
                 and contradictions["contradiction_acknowledgment_rate"] < 0.6
                 and contradictions["contradiction_arrival_rate"] > 0.5,
                 contradictions,
@@ -902,7 +961,7 @@ class AlignmentMonitoringService:
                 "MEDIUM",
                 contradictions["prior_arrival_rate"] > 0
                 and contradictions["contradiction_arrival_rate"] >= contradictions["prior_arrival_rate"] * 2
-                and contradictions["new_contradictions"] > 3,
+                and contradictions["new_contradictions"] > 1,
                 contradictions,
             ),
             self._build_alert(
@@ -954,7 +1013,11 @@ class AlignmentMonitoringService:
             self._build_alert(
                 "BELIEF_INERTIA",
                 "MEDIUM",
-                revisions["no_update_rate"] > 0.65 and contradictions["contradiction_arrival_rate"] > 0.3,
+                revisions["no_update_rate"] > 0.65
+                and (
+                    contradictions["contradiction_arrival_rate"] > 0.3
+                    or contradictions["active_contradiction_topic_count"] > 1
+                ),
                 {**revisions, "contradiction_arrival_rate": contradictions["contradiction_arrival_rate"]},
             ),
             self._build_alert(
@@ -1145,20 +1208,52 @@ class AlignmentMonitoringService:
             if intervention and outcome:
                 grouped.setdefault((intervention, outcome), []).append(claim)
         if not grouped:
-            return {"pair": ("mission evidence", "overall outcome"), "claims": list(claims[:20]), "prior_support_ratio": 0.0}
+            fallback = list(claims[:20])
+            return {
+                "pair": ("mission evidence", "overall outcome"),
+                "claims": fallback,
+                "prior_support_ratio": 0.0,
+                "finding_count": len(fallback),
+                "metadata_completeness": round(
+                    sum(claim_metadata_completeness(claim) for claim in fallback) / len(fallback),
+                    3,
+                ) if fallback else None,
+            }
+
+        def representative_items(items: Sequence[ResearchClaim]) -> List[ResearchClaim]:
+            return [select_representative_claim(group) for group in collapse_claims_to_findings(items)]
 
         def cluster_score(items: Sequence[ResearchClaim]) -> float:
-            return sum(_safe_float(item.composite_confidence) for item in items)
+            return sum(
+                _safe_float(item.composite_confidence) * max(0.55, claim_metadata_completeness(item))
+                for item in representative_items(items)
+            )
 
         pair, cluster_claims = max(grouped.items(), key=lambda item: (cluster_score(item[1]), len(item[1])))
-        cluster_claims = sorted(cluster_claims, key=lambda claim: _safe_float(claim.composite_confidence), reverse=True)
+        cluster_claims = representative_items(cluster_claims)
+        cluster_claims = sorted(
+            cluster_claims,
+            key=lambda claim: (_safe_float(claim.composite_confidence), claim_metadata_completeness(claim)),
+            reverse=True,
+        )
         prior_support_ratio = 0.0
         if len(cluster_claims) > 4:
             earlier = cluster_claims[2:]
             dominant = Counter(claim_direction_value(claim) for claim in earlier).most_common(1)
             if dominant:
                 prior_support_ratio = round(sum(1 for claim in earlier if claim_direction_value(claim) == dominant[0][0]) / len(earlier), 4)
-        return {"pair": pair, "claims": cluster_claims[:20], "prior_support_ratio": prior_support_ratio}
+        visible_claims = cluster_claims[:20]
+        completeness = (
+            round(sum(claim_metadata_completeness(claim) for claim in visible_claims) / len(visible_claims), 3)
+            if visible_claims else None
+        )
+        return {
+            "pair": pair,
+            "claims": visible_claims,
+            "prior_support_ratio": prior_support_ratio,
+            "finding_count": len(cluster_claims),
+            "metadata_completeness": completeness,
+        }
 
     def _primary_cluster_payload(self, cluster: Dict[str, Any]) -> Dict[str, Any]:
         pair = cluster.get("pair") or ("", "")
@@ -1168,7 +1263,9 @@ class AlignmentMonitoringService:
             "intervention": pair[0],
             "outcome": pair[1],
             "claim_count": len(claims),
+            "finding_count": int(cluster.get("finding_count") or len(claims)),
             "direction_breakdown": dict(directions),
+            "metadata_completeness": cluster.get("metadata_completeness"),
         }
 
     def _directional_retrieval_balance(self, raw_papers: Sequence[RawPaperRecord], dominant_direction: str) -> float:
@@ -1188,6 +1285,25 @@ class AlignmentMonitoringService:
             elif dominant_direction == "null" and any(token in title or token in abstract for token in ["no difference", "no significant", "null"]):
                 aligned += 1
         return round(aligned / considered, 4) if considered else 0.0
+
+    def _raw_paper_metadata_completeness(self, row: RawPaperRecord) -> float:
+        payload = row.payload or {}
+        score = 0.0
+        if row.title or payload.get("title"):
+            score += 0.18
+        if row.publication_year or payload.get("publication_year"):
+            score += 0.16
+        if row.study_type or payload.get("study_type"):
+            score += 0.14
+        if row.doi_or_url or payload.get("doi_or_url"):
+            score += 0.12
+        if row.abstract_text or payload.get("abstract_text"):
+            score += 0.16
+        if bool(row.full_text_available):
+            score += 0.12
+        if row.authors or payload.get("authors"):
+            score += 0.12
+        return round(min(score, 1.0), 3)
 
     def _paper_study_type(self, paper: ResearchPaper) -> str:
         breakdown = paper.score_breakdown or {}

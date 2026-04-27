@@ -34,6 +34,7 @@ from app.models.memory import (
     SynthesisTrigger,
 )
 from app.services.llm import get_llm_provider
+from app.services.claim_curation import claim_metadata_completeness
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,33 @@ def _is_directional_contradiction(left: str, right: str) -> bool:
         ("null", "positive"),
     }
     return (left_norm, right_norm) in opposites
+
+
+def _human_effect_phrase(direction: str) -> str:
+    normalized = (direction or "").strip().lower()
+    if normalized == "positive":
+        return "helps or lowers risk"
+    if normalized == "negative":
+        return "harms or raises risk"
+    if normalized == "null":
+        return "has little clear effect"
+    return "has an unclear effect"
+
+
+def _plain_language_contradiction_summary(intervention: Any, outcome: Any, direction_a: str, direction_b: str) -> str:
+    safe_intervention = str(intervention or "this intervention")
+    safe_outcome = str(outcome or "this outcome")
+    directions = {str(direction_a or "").lower(), str(direction_b or "").lower()}
+    if directions == {"positive", "negative"}:
+        return f"The system found studies that disagree about whether {safe_intervention} helps or harms {safe_outcome}."
+    if directions == {"positive", "null"}:
+        return f"The system found studies that disagree about whether {safe_intervention} clearly helps {safe_outcome} or has little clear effect."
+    if directions == {"negative", "null"}:
+        return f"The system found studies that disagree about whether {safe_intervention} harms {safe_outcome} or has little clear effect."
+    return (
+        f"The system found a conflict about {safe_intervention} and {safe_outcome}: "
+        f"one claim says it {_human_effect_phrase(direction_a)}, while another says it {_human_effect_phrase(direction_b)}."
+    )
 
 
 def _same_entity_pair(left: ResearchClaim, right: ResearchClaim) -> bool:
@@ -435,6 +463,21 @@ class MemorySystemService:
                 select(func.count(MissionCheckpoint.id)).where(MissionCheckpoint.mission_id == mission_id)
             )
         ).scalar_one()
+        contradiction_rows = (
+            await self.db.execute(
+                select(ContradictionRecord).where(ContradictionRecord.mission_id == mission_id)
+            )
+        ).scalars().all()
+        claim_rows = (
+            await self.db.execute(
+                select(ResearchClaim).where(ResearchClaim.mission_id == mission_id)
+            )
+        ).scalars().all()
+        contradiction_topics = {
+            ((row.intervention_canonical or "unknown intervention").strip().lower(),
+             (row.outcome_canonical or "unknown outcome").strip().lower())
+            for row in contradiction_rows
+        }
 
         return {
             "mission_id": mission_id,
@@ -445,10 +488,17 @@ class MemorySystemService:
                 "node_count": int(node_count or 0),
                 "edge_count": int(edge_count or 0),
                 "contradictions": int(contradictions or 0),
+                "contradiction_topics": len(contradiction_topics),
             },
             "audit": {
                 "provenance_events": int(provenance_count or 0),
                 "checkpoints": int(checkpoint_count or 0),
+            },
+            "quality": {
+                "claim_metadata_completeness_mean": round(
+                    sum(claim_metadata_completeness(claim) for claim in claim_rows) / len(claim_rows),
+                    3,
+                ) if claim_rows else None,
             },
         }
 
@@ -631,6 +681,12 @@ class MemorySystemService:
                     "claim_b_statement": _claim_statement(claim_b) if claim_b else None,
                     "claim_a_paper_title": getattr(paper_a, "title", None),
                     "claim_b_paper_title": getattr(paper_b, "title", None),
+                    "plain_language_summary": _plain_language_contradiction_summary(
+                        row.intervention_canonical,
+                        row.outcome_canonical,
+                        _enum_value(row.direction_a),
+                        _enum_value(row.direction_b),
+                    ),
                 }
             )
         return items
@@ -1540,6 +1596,7 @@ Return JSON only:
         if not state and not latest_revision and not active_escalation:
             return None
         return {
+            "current_belief_statement": state.current_belief_statement if state else None,
             "current_confidence_score": float(state.current_confidence_score or 0.0) if state else None,
             "dominant_evidence_direction": state.dominant_evidence_direction.value if state else None,
             "current_revision_type": state.current_revision_type.value if state and state.current_revision_type else None,

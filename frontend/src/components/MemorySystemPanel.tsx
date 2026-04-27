@@ -2,8 +2,10 @@ import React from 'react';
 import { Activity, AlertTriangle, GitBranch, History, ShieldCheck } from 'lucide-react';
 
 import { apiClient } from '@/services/api';
+import { ClaimSourceModal } from '@/components/ClaimSourceModal';
 import { MemoryGraphPanel } from '@/components/MemoryGraphPanel';
 import { ScrollFadePanel } from '@/components/ScrollFadePanel';
+import { buildBeliefSummary } from '@/utils/missionNarratives';
 import type {
   MemoryGraphResponse,
   DriftMetric,
@@ -26,6 +28,7 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
   const [graph, setGraph] = React.useState<MemoryGraphResponse | null>(null);
   const [graphError, setGraphError] = React.useState<string | null>(null);
   const [showAllContradictions, setShowAllContradictions] = React.useState(false);
+  const [selectedClaimId, setSelectedClaimId] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -119,7 +122,18 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
               </span>
             </div>
             <p className="text-sm text-neutral-700 mb-3">
-              {overview?.latest_snapshot?.current_belief_statement || 'No memory snapshot has been written yet.'}
+              {buildBeliefSummary({
+                statement:
+                  overview?.latest_snapshot?.current_belief_statement
+                  || overview?.belief_state?.current_belief_statement,
+                direction:
+                  overview?.latest_snapshot?.dominant_evidence_direction
+                  || overview?.belief_state?.dominant_evidence_direction,
+                confidence:
+                  overview?.latest_snapshot?.current_confidence_score
+                  ?? overview?.belief_state?.current_confidence_score,
+                contradictionCount: contradictions.length,
+              })}
             </p>
             <div className="flex flex-wrap gap-3 text-xs text-neutral-600">
               <span>Confidence {(overview?.latest_snapshot?.current_confidence_score ?? 0).toFixed(2)}</span>
@@ -164,7 +178,7 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
               </div>
               <div className="space-y-3">
                 {contradictions.slice(0, 4).map((item) => (
-                  <MemoryContradictionCard key={item.id} item={item} />
+                  <MemoryContradictionCard key={item.id} item={item} onOpenClaimSource={setSelectedClaimId} />
                 ))}
                 {contradictions.length === 0 && <div className="text-sm text-neutral-500">No active contradictions recorded.</div>}
               </div>
@@ -214,9 +228,16 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
       {showAllContradictions && (
         <MemoryContradictionsModal
           contradictions={contradictions}
+          onOpenClaimSource={setSelectedClaimId}
           onClose={() => setShowAllContradictions(false)}
         />
       )}
+
+      <ClaimSourceModal
+        claimId={selectedClaimId}
+        open={selectedClaimId !== null}
+        onClose={() => setSelectedClaimId(null)}
+      />
     </div>
   );
 };
@@ -235,7 +256,10 @@ const StatChip: React.FC<{
   </div>
 );
 
-const MemoryContradictionCard: React.FC<{ item: MemoryContradiction }> = ({ item }) => (
+const MemoryContradictionCard: React.FC<{
+  item: MemoryContradiction;
+  onOpenClaimSource: (claimId: string) => void;
+}> = ({ item, onOpenClaimSource }) => (
   <div className="rounded-md bg-red-50 border border-red-100 p-3">
     <div className="flex items-center justify-between gap-3">
       <span className="text-sm font-medium text-red-900">{item.resolution_status}</span>
@@ -247,23 +271,36 @@ const MemoryContradictionCard: React.FC<{ item: MemoryContradiction }> = ({ item
     <div className="mt-1 text-xs text-red-700">
       {item.direction_a || 'unclear'} vs {item.direction_b || 'unclear'} · population {item.population_overlap || 'unknown'}
     </div>
+    {item.plain_language_summary && (
+      <div className="mt-2 text-sm text-red-900">{item.plain_language_summary}</div>
+    )}
     {item.claim_a_statement && (
-      <div className="mt-3 rounded-md border border-white/70 bg-white/70 px-3 py-2">
+      <button
+        type="button"
+        onClick={() => onOpenClaimSource(item.claim_a_id)}
+        className="mt-3 w-full rounded-md border border-white/70 bg-white/70 px-3 py-2 text-left transition hover:border-red-200 hover:bg-white"
+      >
         <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Claim A</p>
         <p className="mt-1 text-sm text-neutral-800">{item.claim_a_statement}</p>
         {item.claim_a_paper_title && (
           <p className="mt-1 text-xs text-neutral-500">{item.claim_a_paper_title}</p>
         )}
-      </div>
+        <p className="mt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-red-700">Open source</p>
+      </button>
     )}
     {item.claim_b_statement && (
-      <div className="mt-2 rounded-md border border-white/70 bg-white/70 px-3 py-2">
+      <button
+        type="button"
+        onClick={() => onOpenClaimSource(item.claim_b_id)}
+        className="mt-2 w-full rounded-md border border-white/70 bg-white/70 px-3 py-2 text-left transition hover:border-red-200 hover:bg-white"
+      >
         <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Claim B</p>
         <p className="mt-1 text-sm text-neutral-800">{item.claim_b_statement}</p>
         {item.claim_b_paper_title && (
           <p className="mt-1 text-xs text-neutral-500">{item.claim_b_paper_title}</p>
         )}
-      </div>
+        <p className="mt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-red-700">Open source</p>
+      </button>
     )}
     {item.justification && (
       <div className="text-xs text-red-800 mt-2">{item.justification}</div>
@@ -273,8 +310,9 @@ const MemoryContradictionCard: React.FC<{ item: MemoryContradiction }> = ({ item
 
 const MemoryContradictionsModal: React.FC<{
   contradictions: MemoryContradiction[];
+  onOpenClaimSource: (claimId: string) => void;
   onClose: () => void;
-}> = ({ contradictions, onClose }) => (
+}> = ({ contradictions, onOpenClaimSource, onClose }) => (
   <>
     <div className="fixed inset-0 z-40 bg-black/50" onClick={onClose} />
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -295,7 +333,7 @@ const MemoryContradictionsModal: React.FC<{
         <ScrollFadePanel heightClassName="h-[70vh]" className="bg-neutral-50/50">
           <div className="space-y-3 p-5 pb-8">
             {contradictions.map((item) => (
-              <MemoryContradictionCard key={item.id} item={item} />
+              <MemoryContradictionCard key={item.id} item={item} onOpenClaimSource={onOpenClaimSource} />
             ))}
           </div>
         </ScrollFadePanel>

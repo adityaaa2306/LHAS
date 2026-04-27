@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import json
+import re
 from collections import Counter
 from difflib import SequenceMatcher
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 from app.models import ResearchClaim
 
 
 HIGH_SIGNAL_SECTIONS = {"results", "abstract", "conclusion", "discussion"}
+POPULATION_MARKER_TABLE = {
+    "adult": {"adult", "adults"},
+    "pediatric": {"child", "children", "pediatric", "paediatric", "adolescent", "adolescents"},
+    "elderly": {"elderly", "older", "aged", "geriatric"},
+    "female": {"female", "women", "woman", "pregnant", "pregnancy", "breastfeeding"},
+    "male": {"male", "men", "man"},
+    "severe": {"severe", "advanced", "morbid"},
+    "mild": {"mild", "moderate", "early"},
+}
+CONDITION_TERMS = {
+    "schedule": {"daily", "weekly", "monthly", "oral", "subcutaneous"},
+    "co_interventions": {"diet", "exercise", "lifestyle", "surgery", "placebo", "metformin", "empagliflozin"},
+}
 
 
 def _enum_value(value: Any, default: str = "unknown") -> str:
@@ -18,6 +33,14 @@ def _enum_value(value: Any, default: str = "unknown") -> str:
 
 def _provenance(claim: ResearchClaim) -> Dict[str, Any]:
     return claim.provenance or {}
+
+
+def _normalized_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _token_set(value: Any) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", _normalized_text(value)) if len(token) > 2}
 
 
 def claim_text(claim: ResearchClaim) -> str:
@@ -108,6 +131,91 @@ def claim_confidence(claim: ResearchClaim) -> float:
         return 0.0
 
 
+def claim_publication_year(claim: ResearchClaim) -> int | None:
+    provenance = _provenance(claim)
+    document_frame = provenance.get("document_frame") or {}
+    for candidate in (
+        document_frame.get("publication_year"),
+        provenance.get("publication_year"),
+        provenance.get("paper_year"),
+    ):
+        try:
+            if candidate is not None:
+                return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def claim_population_markers(claim: ResearchClaim) -> List[str]:
+    tokens = _token_set(claim.population)
+    return sorted(
+        name for name, vocabulary in POPULATION_MARKER_TABLE.items()
+        if tokens.intersection(vocabulary)
+    )
+
+
+def claim_condition_signature(claim: ResearchClaim) -> Dict[str, List[str]]:
+    text = " ".join(
+        filter(
+            None,
+            [
+                claim.statement_raw or "",
+                claim.statement_normalized or "",
+                json.dumps(_provenance(claim), sort_keys=True),
+            ],
+        )
+    ).lower()
+    signature = {
+        "dosage": sorted(set(re.findall(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml)\b", text))),
+        "duration": sorted(set(re.findall(r"\b\d+\s*(?:day|days|week|weeks|month|months|year|years)\b", text))),
+    }
+    for key, vocabulary in CONDITION_TERMS.items():
+        signature[key] = sorted({word for word in vocabulary if word in text})
+    return signature
+
+
+def claim_context_key(claim: ResearchClaim) -> str:
+    condition = claim_condition_signature(claim)
+    return ";".join(
+        [
+            f"population={'|'.join(claim_population_markers(claim)) or 'generic'}",
+            f"dosage={'|'.join(condition['dosage'][:2]) or 'unspecified'}",
+            f"duration={'|'.join(condition['duration'][:2]) or 'unspecified'}",
+            f"schedule={'|'.join(condition['schedule']) or 'unspecified'}",
+            f"co={'|'.join(condition['co_interventions']) or 'none'}",
+        ]
+    )
+
+
+def claim_metadata_completeness(claim: ResearchClaim) -> float:
+    provenance = _provenance(claim)
+    score = 0.0
+    if claim.statement_raw or claim.statement_normalized:
+        score += 0.15
+    if claim.intervention_canonical and claim.outcome_canonical:
+        score += 0.22
+    elif claim.intervention or claim.outcome:
+        score += 0.12
+    if claim.population:
+        score += 0.08
+    if claim_direction_value(claim) != "unclear":
+        score += 0.08
+    if claim.study_design or float(claim.study_design_score or 0.0) > 0:
+        score += 0.12
+    if claim_section(claim) != "unknown":
+        score += 0.08
+    if claim_publication_year(claim):
+        score += 0.08
+    if claim.paper_title:
+        score += 0.05
+    if provenance.get("evidence_sections") or provenance.get("supporting_chunks") or provenance.get("chunk_ids"):
+        score += 0.12
+    if claim.confidence_components:
+        score += 0.10
+    return round(min(score, 1.0), 3)
+
+
 def claim_presentation_score(claim: ResearchClaim) -> float:
     section_bonus = {
         "results": 0.22,
@@ -119,7 +227,8 @@ def claim_presentation_score(claim: ResearchClaim) -> float:
     canonical_bonus = 0.06 if claim.intervention_canonical and claim.outcome_canonical else 0.0
     relevance_bonus = 0.05 if _enum_value(claim.mission_relevance, "").lower() == "primary" else 0.0
     quantitative_bonus = 0.04 if _provenance(claim).get("quantitative_evidence") else 0.0
-    return claim_confidence(claim) + section_bonus + support_bonus + canonical_bonus + relevance_bonus + quantitative_bonus
+    completeness_bonus = claim_metadata_completeness(claim) * 0.08
+    return claim_confidence(claim) + section_bonus + support_bonus + canonical_bonus + relevance_bonus + quantitative_bonus + completeness_bonus
 
 
 def is_high_signal_claim(claim: ResearchClaim) -> bool:
@@ -173,8 +282,23 @@ def is_high_signal_claim(claim: ResearchClaim) -> bool:
 
 
 def _normalized_entity(value: Any) -> str:
-    text = (str(value or "").strip().lower())
-    return " ".join(text.split())
+    return _normalized_text(value)
+
+
+def claim_topic_key(claim: ResearchClaim) -> str:
+    intervention = _normalized_entity(claim.intervention_canonical or claim.intervention or "unknown intervention")
+    outcome = _normalized_entity(claim.outcome_canonical or claim.outcome or "unknown outcome")
+    return f"{intervention}::{outcome}"
+
+
+def claim_finding_key(claim: ResearchClaim) -> str:
+    return "::".join(
+        [
+            claim_topic_key(claim),
+            claim_direction_value(claim),
+            claim_context_key(claim),
+        ]
+    )
 
 
 def _claim_signature(claim: ResearchClaim) -> str:
@@ -204,6 +328,12 @@ def claims_are_similar(left: ResearchClaim, right: ResearchClaim) -> bool:
         and left_direction != right_direction
     ):
         return False
+    if claim_context_key(left) != claim_context_key(right):
+        left_markers = set(claim_population_markers(left))
+        right_markers = set(claim_population_markers(right))
+        if left_markers or right_markers:
+            if left_markers != right_markers:
+                return False
 
     left_sig = _claim_signature(left)
     right_sig = _claim_signature(right)
@@ -219,6 +349,58 @@ def claims_are_similar(left: ResearchClaim, right: ResearchClaim) -> bool:
     sequence = SequenceMatcher(None, left_sig, right_sig).ratio()
     containment = left_sig in right_sig or right_sig in left_sig
     return containment or jaccard >= 0.56 or sequence >= 0.73
+
+
+def select_representative_claim(claims: Sequence[ResearchClaim]) -> ResearchClaim:
+    return max(
+        claims,
+        key=lambda claim: (
+            claim_presentation_score(claim),
+            claim_metadata_completeness(claim),
+            claim_confidence(claim),
+            claim_support_count(claim),
+        ),
+    )
+
+
+def collapse_claims_to_findings(claims: Sequence[ResearchClaim]) -> List[List[ResearchClaim]]:
+    ordered = sorted(
+        list(claims),
+        key=lambda claim: (
+            claim_presentation_score(claim),
+            claim_metadata_completeness(claim),
+            claim_confidence(claim),
+            claim_support_count(claim),
+        ),
+        reverse=True,
+    )
+
+    buckets: Dict[str, List[List[ResearchClaim]]] = {}
+    for claim in ordered:
+        bucket_key = claim_finding_key(claim)
+        bucket_groups = buckets.setdefault(bucket_key, [])
+        placed = False
+        for group in bucket_groups:
+            if claims_are_similar(claim, group[0]):
+                group.append(claim)
+                placed = True
+                break
+        if not placed:
+            bucket_groups.append([claim])
+
+    groups: List[List[ResearchClaim]] = []
+    for bucket_groups in buckets.values():
+        groups.extend(bucket_groups)
+
+    groups.sort(
+        key=lambda group: (
+            len(group),
+            claim_presentation_score(select_representative_claim(group)),
+            claim_metadata_completeness(select_representative_claim(group)),
+        ),
+        reverse=True,
+    )
+    return groups
 
 
 def confidence_label(score: float) -> str:
@@ -250,20 +432,11 @@ def build_mission_findings(
         reverse=True,
     )
 
-    groups: List[List[ResearchClaim]] = []
-    for claim in ordered:
-        placed = False
-        for group in groups:
-            if claims_are_similar(claim, group[0]):
-                group.append(claim)
-                placed = True
-                break
-        if not placed:
-            groups.append([claim])
+    groups = collapse_claims_to_findings(ordered)
 
     findings: List[Dict[str, Any]] = []
     for group in groups:
-        primary = max(group, key=claim_presentation_score)
+        primary = select_representative_claim(group)
         paper_titles: List[str] = []
         paper_ids = set()
         evidence_sections = set()
@@ -300,6 +473,10 @@ def build_mission_findings(
             "evidence_sections": sorted(section for section in evidence_sections if section),
             "aggregation_scope": "mission_finding",
             "raw_claim_ids": [str(claim.id) for claim in group],
+            "finding_key": claim_finding_key(primary),
+            "topic_key": claim_topic_key(primary),
+            "context_key": claim_context_key(primary),
+            "metadata_completeness": round(max(claim_metadata_completeness(claim) for claim in group), 3),
             "extracted_at": primary.extraction_timestamp.isoformat() if primary.extraction_timestamp else None,
         }
         finding.update(
