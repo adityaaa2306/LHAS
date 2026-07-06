@@ -79,6 +79,11 @@ async def init_db():
         mission_alters = [
             "ALTER TABLE missions ADD COLUMN IF NOT EXISTS benchmark_text TEXT",
             "ALTER TABLE missions ADD COLUMN IF NOT EXISTS benchmark_source VARCHAR(255)",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS ingestion_current_stage VARCHAR(64)",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS ingestion_stage_detail TEXT",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS ingestion_activity_log TEXT",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS ingestion_background_tasks TEXT",
+            "ALTER TABLE missions ADD COLUMN IF NOT EXISTS ingestion_stats TEXT",
         ]
         for statement in mission_alters:
             try:

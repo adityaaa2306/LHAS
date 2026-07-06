@@ -4,10 +4,12 @@ import { Activity, AlertTriangle, GitBranch, History, ShieldCheck } from 'lucide
 import { apiClient } from '@/services/api';
 import { ClaimSourceModal } from '@/components/ClaimSourceModal';
 import { MemoryGraphPanel } from '@/components/MemoryGraphPanel';
+import { MemoryPipelineDiagnostics } from '@/components/MemoryPipelineDiagnostics';
 import { ScrollFadePanel } from '@/components/ScrollFadePanel';
 import { buildBeliefSummary } from '@/utils/missionNarratives';
 import type {
   MemoryGraphResponse,
+  PipelineDiagnostics,
   DriftMetric,
   MemoryContradiction,
   MemoryOverview,
@@ -26,6 +28,7 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
   const [contradictions, setContradictions] = React.useState<MemoryContradiction[]>([]);
   const [provenance, setProvenance] = React.useState<MemoryProvenanceEvent[]>([]);
   const [graph, setGraph] = React.useState<MemoryGraphResponse | null>(null);
+  const [diagnostics, setDiagnostics] = React.useState<PipelineDiagnostics | null>(null);
   const [graphError, setGraphError] = React.useState<string | null>(null);
   const [showAllContradictions, setShowAllContradictions] = React.useState(false);
   const [selectedClaimId, setSelectedClaimId] = React.useState<string | null>(null);
@@ -40,16 +43,17 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
         setLoading(true);
         setError(null);
         setGraphError(null);
-        const [overviewRes, snapshotsRes, driftRes, contradictionsRes, provenanceRes, graphRes] = await Promise.all([
+        const [overviewRes, snapshotsRes, driftRes, contradictionsRes, provenanceRes, graphRes, diagRes] = await Promise.all([
           apiClient.getMemoryOverview(missionId),
           apiClient.getMemorySnapshots(missionId),
           apiClient.getMemoryDrift(missionId),
           apiClient.getMemoryContradictions(missionId),
           apiClient.getMemoryProvenance(missionId, { limit: 8 }),
-          apiClient.getMemoryGraph(missionId, { max_nodes: 48, max_edges: 120 }).catch((err) => {
+          apiClient.getMemoryGraph(missionId, { max_nodes: 80, max_edges: 200 }).catch((err) => {
             setGraphError(err instanceof Error ? err.message : 'Failed to load graph');
             return null;
           }),
+          apiClient.getPipelineDiagnostics(missionId).catch(() => null),
         ]);
         if (cancelled) return;
         setOverview(overviewRes);
@@ -58,6 +62,7 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
         setContradictions((contradictionsRes?.contradictions || []) as MemoryContradiction[]);
         setProvenance((provenanceRes?.events || []) as MemoryProvenanceEvent[]);
         setGraph((graphRes as MemoryGraphResponse | null) ?? null);
+        setDiagnostics((diagRes as PipelineDiagnostics | null) ?? null);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : 'Failed to load memory state');
@@ -96,6 +101,8 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
           </div>
 
           <MemoryGraphPanel graph={graph} error={graphError} />
+
+          <MemoryPipelineDiagnostics diagnostics={diagnostics} />
 
           {overview?.belief_state && (
             <section className="rounded-lg border border-blue-200 bg-blue-50 p-4">
@@ -180,7 +187,11 @@ export const MemorySystemPanel: React.FC<MemorySystemPanelProps> = ({ missionId 
                 {contradictions.slice(0, 4).map((item) => (
                   <MemoryContradictionCard key={item.id} item={item} onOpenClaimSource={setSelectedClaimId} />
                 ))}
-                {contradictions.length === 0 && <div className="text-sm text-neutral-500">No active contradictions recorded.</div>}
+                {contradictions.length === 0 && (
+                  <div className="text-sm text-neutral-500">
+                    {diagnostics?.contradiction_explanation || 'No active contradictions recorded.'}
+                  </div>
+                )}
               </div>
             </section>
           </div>

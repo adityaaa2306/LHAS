@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.memory_system import MemorySystemService
+from app.services.pipeline_diagnostics import PipelineDiagnosticsService
 from app.models.memory import SynthesisTrigger
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
@@ -94,6 +95,19 @@ async def get_active_contradictions(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to load contradictions: {exc}")
+
+
+@router.get("/missions/{mission_id}/diagnostics")
+async def get_pipeline_diagnostics(
+    mission_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Developer diagnostics — verify every pipeline stage with real DB counts."""
+    try:
+        service = PipelineDiagnosticsService(db)
+        return await service.get_mission_diagnostics(mission_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load pipeline diagnostics: {exc}")
 
 
 @router.get("/missions/{mission_id}/graph")

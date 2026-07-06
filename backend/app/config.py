@@ -3,6 +3,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_PLACEHOLDER_VALUES = frozenset({
+    "",
+    "api_key_here",
+    "your_nvidia_api_key_here",
+    "nvidia_api_key_here",
+    "your_key",
+    "your_openai_api_key_here",
+})
+
+
+def _env(name: str, default: str = "") -> str:
+    """Read env var, treating template placeholders as unset."""
+    value = os.getenv(name, default)
+    if value is None:
+        return default
+    stripped = value.strip()
+    if stripped.lower() in _PLACEHOLDER_VALUES:
+        return default
+    return stripped
+
 
 class Settings:
     """Application settings from environment variables."""
@@ -34,23 +54,23 @@ class Settings:
     MAX_PAGE_SIZE = 500
 
     # Paper Ingestion API Keys
-    SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
-    PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "")
-    GROBID_URL = os.getenv("GROBID_URL", "http://localhost:8070")
+    SEMANTIC_SCHOLAR_API_KEY = _env("SEMANTIC_SCHOLAR_API_KEY")
+    PUBMED_API_KEY = _env("PUBMED_API_KEY")
+    GROBID_URL = _env("GROBID_URL", "http://localhost:8070")
 
     # NVIDIA NIM Configuration (LLM Provider)
-    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-    NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-r1")
-    NVIDIA_TEMPERATURE = float(os.getenv("NVIDIA_TEMPERATURE", "0.6"))
-    NVIDIA_TOP_P = float(os.getenv("NVIDIA_TOP_P", "0.7"))
-    NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "4096"))
+    NVIDIA_API_KEY = _env("NVIDIA_API_KEY")
+    NVIDIA_BASE_URL = _env("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    NVIDIA_MODEL = _env("NVIDIA_MODEL", "deepseek-ai/deepseek-r1")
+    NVIDIA_TEMPERATURE = float(_env("NVIDIA_TEMPERATURE", "0.6"))
+    NVIDIA_TOP_P = float(_env("NVIDIA_TOP_P", "0.7"))
+    NVIDIA_MAX_TOKENS = int(_env("NVIDIA_MAX_TOKENS", "4096"))
 
-    # NVIDIA Embedding Model Configuration
-    EMBEDDING_MODEL_API_KEY = os.getenv("EMBEDDING_MODEL_API_KEY", "")
-    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "nvidia/llama-nemotron-embed-1b-v2")
-    EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+    # NVIDIA Embedding Model Configuration (falls back to NVIDIA_API_KEY if dedicated key unset)
+    EMBEDDING_MODEL_API_KEY = _env("EMBEDDING_MODEL_API_KEY") or _env("NVIDIA_API_KEY")
+    EMBEDDING_MODEL_NAME = _env("EMBEDDING_MODEL_NAME", "nvidia/llama-nemotron-embed-1b-v2")
+    EMBEDDING_BASE_URL = _env("EMBEDDING_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    EMBEDDING_BATCH_SIZE = int(_env("EMBEDDING_BATCH_SIZE", "32"))
 
     @property
     def is_production(self) -> bool:

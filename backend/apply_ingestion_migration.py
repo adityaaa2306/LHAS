@@ -20,7 +20,11 @@ ALTER TABLE missions
     ADD COLUMN IF NOT EXISTS ingestion_progress INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS ingestion_error TEXT,
     ADD COLUMN IF NOT EXISTS ingestion_started_at TIMESTAMP,
-    ADD COLUMN IF NOT EXISTS ingestion_completed_at TIMESTAMP;
+    ADD COLUMN IF NOT EXISTS ingestion_completed_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS ingestion_current_stage VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS ingestion_stage_detail TEXT,
+    ADD COLUMN IF NOT EXISTS ingestion_activity_log TEXT,
+    ADD COLUMN IF NOT EXISTS ingestion_background_tasks TEXT;
 """
 
 

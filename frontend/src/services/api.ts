@@ -3,7 +3,8 @@
  * Handles all backend communication
  */
 
-import type { MemoryGraphResponse, MonitoringOverview, MonitoringSnapshotView, MonitoringAlertRecordView, SynthesisVersion } from '@/types';
+import type { MemoryGraphResponse, PipelineDiagnostics, MonitoringOverview, MonitoringSnapshotView, MonitoringAlertRecordView, SynthesisVersion } from '@/types';
+import type { IngestionStatusResponse } from '@/types/ingestion';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -74,7 +75,12 @@ class APIClient {
    * @param options Fetch options
    * @param timeout Request timeout in milliseconds (default 15s)
    */
-  async request<T>(endpoint: string, options?: RequestInit, timeout: number = this.requestTimeout): Promise<T> {
+  async request<T>(
+    endpoint: string,
+    options?: RequestInit,
+    timeout: number = this.requestTimeout,
+    requestOptions?: { silentTimeout?: boolean },
+  ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -98,7 +104,9 @@ class APIClient {
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         const timeoutError = new Error(`Request timeout after ${timeout}ms: ${endpoint}`);
-        console.error(`API Timeout [${endpoint}]:`, timeoutError);
+        if (!requestOptions?.silentTimeout) {
+          console.error(`API Timeout [${endpoint}]:`, timeoutError);
+        }
         throw timeoutError;
       }
       console.error(`API Error [${endpoint}]:`, error);
@@ -188,15 +196,16 @@ class APIClient {
     );
   }
 
-  async getIngestionStatus(missionId: string): Promise<{
-    mission_id: string;
-    status: 'idle' | 'pending' | 'processing' | 'completed' | 'failed';
-    progress: number;
-    error: string | null;
-    started_at: string | null;
-    completed_at: string | null;
-  }> {
-    return this.request(`/api/papers/ingest/status/${missionId}`, undefined, 10000);
+  async getIngestionStatus(
+    missionId: string,
+    options?: { silentTimeout?: boolean },
+  ): Promise<IngestionStatusResponse> {
+    return this.request<IngestionStatusResponse>(
+      `/api/papers/ingest/status/${missionId}`,
+      undefined,
+      8000,
+      options,
+    );
   }
 
   // Graph endpoints
@@ -286,6 +295,10 @@ class APIClient {
     if (options?.max_edges !== undefined) params.append('max_edges', options.max_edges.toString());
     const queryString = params.toString();
     return this.request<MemoryGraphResponse>(`/api/memory/missions/${missionId}/graph${queryString ? `?${queryString}` : ''}`);
+  }
+
+  async getPipelineDiagnostics(missionId: string): Promise<PipelineDiagnostics> {
+    return this.request<PipelineDiagnostics>(`/api/memory/missions/${missionId}/diagnostics`);
   }
 
   async getContradictionOverview(missionId: string): Promise<any> {

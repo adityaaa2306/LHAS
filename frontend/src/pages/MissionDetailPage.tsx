@@ -28,6 +28,9 @@ import { ExpandableText } from '@/components/ExpandableText';
 import { ContradictionHandlingPanel } from '@/components/ContradictionHandlingPanel';
 import { MemorySystemPanel } from '@/components/MemorySystemPanel';
 import { ScrollFadePanel } from '@/components/ScrollFadePanel';
+import { MissionProgressPanel } from '@/components/MissionProgressPanel';
+import { useIngestionPoller } from '@/hooks/useIngestionPoller';
+import type { IngestionStatusResponse } from '@/types/ingestion';
 import type { ConfirmedContradiction, MemoryOverview, MissionSnapshot, MonitoringOverview, SynthesisVersion } from '@/types';
 import { buildBeliefSummary, formatReasoningOutcome } from '@/utils/missionNarratives';
 
@@ -97,31 +100,128 @@ export const MissionDetailPage: React.FC = () => {
   const [isIngesting, setIsIngesting] = React.useState(false);
   const [isGeneratingSynthesis, setIsGeneratingSynthesis] = React.useState(false);
   const [ingestionError, setIngestionError] = React.useState<string | null>(null);
-  const pollingInterval = React.useRef<ReturnType<typeof setInterval> | null>(null);
+  const [ingestionStatus, setIngestionStatus] = React.useState<IngestionStatusResponse | null>(null);
+  const hasTriggeredIngestion = React.useRef(false);
+  const lastMissionIdRef = React.useRef<string | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
+
+  const refreshPartialResults = React.useCallback(async (stage?: string) => {
+    if (!missionId) return;
+    const refreshPapers = stage && ['storing_papers', 'storing_vectors', 'creating_claims', 'finalizing'].some(
+      (s) => stage.includes(s) || stage === s,
+    );
+    const refreshClaims = stage && ['creating_claims', 'detecting_contradictions', 'generating_synthesis', 'building_memory', 'finalizing'].some(
+      (s) => stage.includes(s) || stage === s,
+    );
+
+    const tasks: Promise<void>[] = [];
+    if (refreshPapers || !stage) {
+      tasks.push(
+        apiClient.getMissionPapers(missionId)
+          .then((data) => setPapers((data as any)?.papers || []))
+          .catch(() => undefined),
+      );
+    }
+    if (refreshClaims || !stage) {
+      tasks.push(
+        apiClient.getMissionClaims(missionId)
+          .then((data) => setClaims((data as any)?.claims || []))
+          .catch(() => undefined),
+      );
+    }
+  }, [missionId]);
+
+  const handleIngestionProgress = React.useCallback((data: IngestionStatusResponse) => {
+    setIngestionStatus(data);
+    if (data.current_stage) {
+      void refreshPartialResults(data.current_stage);
+    }
+    if (data.status === 'completed' && data.current_stage === 'storing_papers') {
+      void refreshPartialResults('finalizing');
+    }
+  }, [refreshPartialResults]);
+
+  const handleIngestionComplete = React.useCallback(async (data: IngestionStatusResponse) => {
+    setIngestionStatus(data);
+    setIsIngesting(false);
+    setIngestionError(null);
+    if (!missionId) return;
+    const [papersData, claimsData, synthLatest, synthHistory] = await Promise.all([
+      apiClient.getMissionPapers(missionId).catch(() => null),
+      apiClient.getMissionClaims(missionId).catch(() => null),
+      apiClient.getMissionSynthesis(missionId).catch(() => null),
+      apiClient.getSynthesisHistory(missionId, 6).catch(() => null),
+    ]);
+    if (papersData) setPapers((papersData as any)?.papers || []);
+    if (claimsData) setClaims((claimsData as any)?.claims || []);
+    if (synthLatest) setSynthesis(synthLatest.synthesis ?? null);
+    if (synthHistory) setSynthesisHistory(synthHistory.history || []);
+    apiClient.getMemoryOverview(missionId).then((d) => setMemoryOverview(d as MemoryOverview)).catch(() => null);
+    apiClient.getConfirmedContradictions(missionId).then((d) => setConfirmedContradictions((d as any)?.contradictions || [])).catch(() => null);
+    apiClient.getMissionTimeline(missionId).then((d) => setTimeline((d as any)?.timeline || [])).catch(() => null);
+    apiClient.getMissionGraphStats(missionId).then(setGraphStats).catch(() => null);
+  }, [missionId]);
+
+  const handleIngestionFailed = React.useCallback((data: IngestionStatusResponse) => {
+    setIngestionStatus(data);
+    setIsIngesting(false);
+    setIngestionError(data.error || 'Ingestion failed. Try again.');
+  }, []);
+
+  const { status: polledStatus } = useIngestionPoller({
+    missionId,
+    enabled: isIngesting,
+    onProgress: handleIngestionProgress,
+    onComplete: handleIngestionComplete,
+    onFailed: handleIngestionFailed,
+  });
+
+  const activeIngestionStatus = polledStatus ?? ingestionStatus;
+
+  const triggerIngestionOnce = React.useCallback(async () => {
+    if (!missionId || hasTriggeredIngestion.current) return;
+    hasTriggeredIngestion.current = true;
+    setIngestionError(null);
+    try {
+      const res = await apiClient.triggerIngestion(missionId);
+      if (res.status === 'started' || res.status === 'already_running') {
+        setIsIngesting(true);
+      } else {
+        hasTriggeredIngestion.current = false;
+      }
+    } catch (err) {
+      hasTriggeredIngestion.current = false;
+      setIngestionError(err instanceof Error ? err.message : 'Failed to start ingestion');
+    }
+  }, [missionId]);
 
   React.useEffect(() => {
     if (!missionId) return;
+
+    if (lastMissionIdRef.current !== missionId) {
+      hasTriggeredIngestion.current = false;
+      lastMissionIdRef.current = missionId;
+    }
+    abortRef.current?.abort();
+    abortRef.current = new AbortController();
 
     const fetchMissionData = async () => {
       try {
         setLoading(true);
         setError(null);
 
-        // PHASE 1: Load critical data in parallel — including ingestion status from DB
-        console.log('📊 Loading mission detail, papers, and ingestion status...');
         const [missionData, papersData, ingestionStatusData] = await Promise.all([
           apiClient.getMissionDetail(missionId).catch(() => null),
           apiClient.getMissionPapers(missionId).catch(() => null),
-          apiClient.getIngestionStatus(missionId).catch(() => null),
+          apiClient.getIngestionStatus(missionId, { silentTimeout: true }).catch(() => null),
         ]);
 
         setMission(missionData as MissionDetailData);
         const loadedPapers = (papersData as any)?.papers || [];
         setPapers(loadedPapers);
+        if (ingestionStatusData) setIngestionStatus(ingestionStatusData);
         setLoading(false);
 
-        // PHASE 2: Load optional data (non-blocking)
-        console.log('Loading synthesis...');
         Promise.all([
           apiClient.getMissionSynthesis(missionId),
           apiClient.getSynthesisHistory(missionId, 6),
@@ -130,144 +230,77 @@ export const MissionDetailPage: React.FC = () => {
             setSynthesis(latest.synthesis ?? null);
             setSynthesisHistory(history.history || []);
           })
-          .catch(err => console.warn('Synthesis load failed:', err));
+          .catch(() => undefined);
 
         setTimeout(() => {
-          console.log('🎯 Loading claims...');
           apiClient.getMissionClaims(missionId)
-            .then(data => setClaims((data as any)?.claims || []))
-            .catch(err => console.warn('Claims load failed:', err));
+            .then((data) => setClaims((data as any)?.claims || []))
+            .catch(() => undefined);
         }, 200);
 
         setTimeout(() => {
-          console.log('⚡ Loading confirmed contradictions...');
           apiClient.getConfirmedContradictions(missionId)
-            .then(data => setConfirmedContradictions((data as any)?.contradictions || []))
-            .catch(err => console.warn('Confirmed contradictions load failed:', err));
+            .then((data) => setConfirmedContradictions((data as any)?.contradictions || []))
+            .catch(() => undefined);
         }, 300);
 
         if (loadedPapers.length > 0) {
           apiClient.getMissionGraphStats(missionId)
-            .then(data => setGraphStats(data))
-            .catch(err => console.warn('Graph stats load failed:', err));
+            .then((data) => setGraphStats(data))
+            .catch(() => undefined);
         }
 
         setTimeout(() => {
-          console.log('🧠 Loading reasoning...');
           apiClient.getMissionReasoning(missionId)
-            .then(data => setReasoning((data as any)?.reasoning_steps || []))
-            .catch(err => console.warn('Reasoning load failed:', err));
+            .then((data) => setReasoning((data as any)?.reasoning_steps || []))
+            .catch(() => undefined);
         }, 400);
 
         setTimeout(() => {
-          console.log('⏰ Loading timeline...');
           apiClient.getMissionTimeline(missionId)
-            .then(data => setTimeline((data as any)?.timeline || []))
-            .catch(err => console.warn('Timeline load failed:', err));
+            .then((data) => setTimeline((data as any)?.timeline || []))
+            .catch(() => undefined);
         }, 600);
 
         setTimeout(() => {
-          console.log('🧠 Loading memory overview...');
           apiClient.getMemoryOverview(missionId)
-            .then(data => setMemoryOverview(data as MemoryOverview))
-            .catch(err => console.warn('Memory overview load failed:', err));
+            .then((data) => setMemoryOverview(data as MemoryOverview))
+            .catch(() => undefined);
         }, 150);
 
         setTimeout(() => {
-          console.log('📈 Loading memory snapshots...');
           apiClient.getMemorySnapshots(missionId)
-            .then(data => setMemorySnapshots((data as any)?.snapshots || []))
-            .catch(err => console.warn('Memory snapshots load failed:', err));
+            .then((data) => setMemorySnapshots((data as any)?.snapshots || []))
+            .catch(() => undefined);
         }, 180);
 
         setTimeout(() => {
-          console.log('🛡️ Loading monitoring overview...');
           apiClient.getMonitoringOverview(missionId)
-            .then(data => setMonitoringOverview(data as MonitoringOverview))
-            .catch(err => console.warn('Monitoring overview load failed:', err));
+            .then((data) => setMonitoringOverview(data as MonitoringOverview))
+            .catch(() => undefined);
         }, 250);
 
-        // Decide ingestion state based on the DB's ingestion_status — never use local flag
         const ingStatus = ingestionStatusData?.status || 'idle';
-        console.log('🔍 Ingestion status from DB:', ingStatus);
 
         if (ingStatus === 'processing' || ingStatus === 'pending') {
-          // Already running in background — just resume polling
-          console.log('▶️ Resuming poll for in-progress ingestion...');
           setIsIngesting(true);
         } else if (ingStatus === 'idle' && loadedPapers.length === 0) {
-          // Fresh mission with no papers — auto-trigger
-          console.log('🚀 Auto-triggering ingestion for mission:', missionId);
-          apiClient.triggerIngestion(missionId)
-            .then((res) => {
-              console.log('✅ Ingestion started:', res.status);
-              if (res.status === 'started' || res.status === 'already_running') {
-                setIsIngesting(true);
-              }
-            })
-            .catch(err => console.error('❌ Ingestion trigger failed:', err));
+          void triggerIngestionOnce();
         } else if (ingStatus === 'failed') {
-          // Show the stored error so user can retry
           setIngestionError(ingestionStatusData?.error || 'Previous ingestion failed. Click Retry to try again.');
         }
-        // 'completed' — do nothing, papers already loaded above
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load mission');
-        console.error('Mission detail fetch error:', err);
         setLoading(false);
       }
     };
 
-    fetchMissionData();
-  }, [missionId]); // Only depends on missionId — not on local ingestion state
-
-  // Poll the dedicated ingestion status endpoint every 3 seconds while ingesting.
-  // When the job reaches "completed" or "failed" we stop polling and refresh papers.
-  React.useEffect(() => {
-    if (!missionId || !isIngesting) return;
-
-    // Hard timeout: if still "processing" after 10 minutes, treat as failed
-    const hardTimeout = setTimeout(() => {
-      console.warn('⏰ Ingestion hard timeout (10 min) — stopping poll.');
-      setIsIngesting(false);
-    }, 10 * 60 * 1000);
-
-    const pollStatus = async () => {
-      try {
-        const statusData = await apiClient.getIngestionStatus(missionId);
-        console.log('📊 Ingestion status:', statusData.status, `${statusData.progress}%`);
-
-        if (statusData.status === 'completed' || statusData.status === 'failed') {
-          setIsIngesting(false);
-          clearTimeout(hardTimeout);
-          if (pollingInterval.current) {
-            clearInterval(pollingInterval.current);
-          }
-          if (statusData.status === 'completed') {
-            setIngestionError(null);
-            // Refresh papers now that ingestion is done
-            apiClient.getMissionPapers(missionId)
-              .then(data => setPapers((data as any)?.papers || []))
-              .catch(err => console.warn('Paper refresh failed:', err));
-          } else {
-            console.error('❌ Ingestion failed:', statusData.error);
-            setIngestionError(statusData.error || 'Ingestion failed. Try again.');
-          }
-        }
-      } catch (err) {
-        console.error('Error polling ingestion status:', err);
-      }
-    };
-
-    pollingInterval.current = setInterval(pollStatus, 3000);
+    void fetchMissionData();
 
     return () => {
-      clearTimeout(hardTimeout);
-      if (pollingInterval.current) {
-        clearInterval(pollingInterval.current);
-      }
+      abortRef.current?.abort();
     };
-  }, [missionId, isIngesting]);
+  }, [missionId, triggerIngestionOnce]);
 
   const handleRegenerateSynthesis = React.useCallback(async () => {
     if (!missionId) return;
@@ -487,7 +520,21 @@ export const MissionDetailPage: React.FC = () => {
     switch (activeSection) {
       case 'dashboard':
         return (
-          <MissionDashboardSection
+          <div className="space-y-6">
+            {(isIngesting || activeIngestionStatus || ingestionError) && (
+              <MissionProgressPanel
+                status={activeIngestionStatus}
+                isActive={isIngesting}
+                missionName={mission.name}
+                error={ingestionError}
+                onRetry={() => {
+                  hasTriggeredIngestion.current = false;
+                  setIngestionError(null);
+                  void triggerIngestionOnce();
+                }}
+              />
+            )}
+            <MissionDashboardSection
             currentConfidenceScore={currentConfidenceScore}
             dominantDirection={currentDominantDirection}
             overallHealth={displayedHealth}
@@ -503,6 +550,7 @@ export const MissionDetailPage: React.FC = () => {
             onOpenContradictions={() => setActiveSection('contradictions')}
             onOpenSynthesis={() => setActiveSection('synthesis')}
           />
+          </div>
         );
       case 'synthesis':
         return (
@@ -524,16 +572,12 @@ export const MissionDetailPage: React.FC = () => {
               papers={papers}
               isIngesting={isIngesting}
               ingestionError={ingestionError}
+              ingestionStatus={activeIngestionStatus}
               mission={mission}
               onRetry={() => {
+                hasTriggeredIngestion.current = false;
                 setIngestionError(null);
-                if (missionId) {
-                  apiClient.triggerIngestion(missionId)
-                    .then((res) => {
-                      if (res.status === 'started' || res.status === 'already_running') setIsIngesting(true);
-                    })
-                    .catch(err => setIngestionError(String(err)));
-                }
+                void triggerIngestionOnce();
               }}
               onCompareClick={(paperId) => {
                 setComparisonMode(true);
@@ -1644,11 +1688,12 @@ const EvidencePapersCard: React.FC<{
   papers: any[];
   isIngesting: boolean;
   ingestionError?: string | null;
+  ingestionStatus?: IngestionStatusResponse | null;
   mission: MissionDetailData | null;
   onRetry?: () => void;
   onCompareClick?: (paperId: string) => void;
   onGraphClick?: (paperId: string) => void;
-}> = ({ papers, isIngesting, ingestionError, mission, onRetry, onCompareClick, onGraphClick }) => {
+}> = ({ papers, isIngesting, ingestionError, ingestionStatus, mission, onRetry, onCompareClick, onGraphClick }) => {
   const [expandedPaperId, setExpandedPaperId] = React.useState<string | null>(null);
 
   return (
@@ -1673,12 +1718,21 @@ const EvidencePapersCard: React.FC<{
               <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
                 <div className="flex items-center gap-3 mb-3">
                   <Loader size={18} className="animate-spin text-blue-600" />
-                  <div>
-                    <p className="font-semibold text-blue-900">Ingesting papers for "{mission?.name}"</p>
+                  <div className="flex-1">
+                    <p className="font-semibold text-blue-900">
+                      {ingestionStatus?.stage_detail || `Ingesting papers for "${mission?.name}"`}
+                    </p>
                     <p className="text-sm text-blue-700 mt-1">
-                      {papers.length} {papers.length === 1 ? 'paper' : 'papers'} ingested so far...
+                      {ingestionStatus?.progress ?? 0}% complete
+                      {papers.length > 0 && ` · ${papers.length} papers available so far`}
                     </p>
                   </div>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-blue-100">
+                  <div
+                    className="h-full rounded-full bg-blue-600 transition-all duration-500"
+                    style={{ width: `${ingestionStatus?.progress ?? 0}%` }}
+                  />
                 </div>
               </div>
             )}
@@ -2064,7 +2118,9 @@ const TimelineCard: React.FC<{ timeline: any[]; expandedId: string | null; onExp
   expandedId,
   onExpandId,
 }) => {
-  const getEventColor = (type: string) => {
+  const getEventColor = (type: string, level?: string) => {
+    if (level === 'error') return 'bg-red-500';
+    if (level === 'warning') return 'bg-amber-500';
     if (type?.includes('ingestion')) return 'bg-blue-500';
     if (type?.includes('synthesis') || type?.includes('analysis')) return 'bg-green-500';
     if (type?.includes('contradiction')) return 'bg-red-500';
@@ -2072,53 +2128,115 @@ const TimelineCard: React.FC<{ timeline: any[]; expandedId: string | null; onExp
     return 'bg-neutral-400';
   };
 
+  const formatTimestamp = (iso: string | null | undefined) => {
+    if (!iso) return '—';
+    try {
+      return new Date(iso).toLocaleString([], {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return iso;
+    }
+  };
+
+  const getSourceLabel = (event: any) => {
+    if (event.source === 'ingestion') return 'Pipeline log';
+    if (event.event_type?.includes('synthesis')) return 'Synthesis';
+    if (event.event_type?.includes('belief')) return 'Belief revision';
+    return 'Mission event';
+  };
+
   return (
-    <div className="bg-white border border-neutral-200 rounded-lg overflow-hidden flex flex-col flex-1">
+    <div className="bg-white border border-neutral-200 rounded-lg overflow-hidden flex flex-col flex-1 min-h-[32rem]">
       <div className="px-6 py-4 border-b border-neutral-200 flex-shrink-0">
         <h2 className="font-semibold text-neutral-900 flex items-center gap-2">
-        <Clock size={18} className="text-red-600" />
+          <Clock size={18} className="text-red-600" />
           Mission Timeline
           <span className="text-xs font-medium px-2 py-1 bg-neutral-100 text-neutral-700 rounded-full">
             {timeline.length}
           </span>
         </h2>
+        <p className="mt-1 text-xs text-neutral-500">
+          Chronological mission events and pipeline activity logs
+        </p>
       </div>
 
       {timeline.length === 0 ? (
         <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
           <Clock size={28} className="text-neutral-300 mb-2" />
           <p className="text-neutral-700 font-medium text-sm mb-1">No events yet</p>
-          <p className="text-neutral-600 text-xs">Activity will be tracked here</p>
+          <p className="text-neutral-600 text-xs">Run ingestion to populate the activity log</p>
         </div>
       ) : (
         <div className="overflow-y-auto flex-1">
-          <div className="space-y-2 p-6">
-            {timeline.slice(0, 6).map((event) => (
-              <button
-                key={event.id}
-                onClick={() => onExpandId(expandedId === event.id ? null : event.id)}
-                className="w-full text-left p-3 rounded-lg border border-neutral-200 hover:border-neutral-300 hover:bg-neutral-50 transition-all group"
-              >
-                <div className="flex items-start gap-3">
-                  <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 mt-1 ${getEventColor(event.event_type || '')}`} />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-semibold text-neutral-900 line-clamp-1">{event.event_title}</p>
-                    <p className="text-xs text-neutral-600 mt-0.5">Cycle #{event.cycle_number || 0}</p>
-                    {expandedId === event.id && event.event_description && (
-                      <p className="text-xs text-neutral-700 mt-2 pt-2 border-t border-neutral-200">
-                        {event.event_description}
+          <div className="divide-y divide-neutral-100">
+            {timeline.map((event) => {
+              const isLog = event.source === 'ingestion' || event.event_type === 'ingestion_log';
+              const isExpanded = expandedId === event.id;
+              const textClass =
+                event.level === 'error'
+                  ? 'text-red-700'
+                  : event.level === 'warning'
+                    ? 'text-amber-800'
+                    : 'text-neutral-800';
+
+              return (
+                <button
+                  key={event.id}
+                  type="button"
+                  onClick={() => onExpandId(isExpanded ? null : event.id)}
+                  className="w-full text-left px-6 py-3.5 hover:bg-neutral-50 transition-colors group"
+                >
+                  <div className="flex items-start gap-3">
+                    <div
+                      className={`w-2 h-2 rounded-full flex-shrink-0 mt-2 ${getEventColor(
+                        event.event_type || '',
+                        event.level,
+                      )}`}
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-1">
+                        <span className="font-mono text-[11px] text-neutral-500 tabular-nums">
+                          {formatTimestamp(event.occurred_at)}
+                        </span>
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">
+                          {getSourceLabel(event)}
+                        </span>
+                        {event.cycle_number != null && event.cycle_number > 0 && (
+                          <span className="text-[10px] text-neutral-400">Cycle #{event.cycle_number}</span>
+                        )}
+                      </div>
+                      <p className={`text-sm leading-snug ${isLog ? textClass : 'font-semibold text-neutral-900'}`}>
+                        {event.event_title}
                       </p>
+                      {isExpanded && event.event_description && (
+                        <p className="text-xs text-neutral-600 mt-2 pt-2 border-t border-neutral-100">
+                          {event.event_description}
+                        </p>
+                      )}
+                      {isExpanded && event.metrics_change && Object.keys(event.metrics_change).length > 0 && (
+                        <p className="text-xs text-neutral-500 mt-2 font-mono">
+                          {JSON.stringify(event.metrics_change)}
+                        </p>
+                      )}
+                    </div>
+                    {!isLog && (
+                      <ChevronRight
+                        size={16}
+                        className={`text-neutral-400 group-hover:text-neutral-600 flex-shrink-0 mt-1 transition-transform ${
+                          isExpanded ? 'rotate-90' : ''
+                        }`}
+                      />
                     )}
                   </div>
-                  <ChevronRight
-                    size={16}
-                    className={`text-neutral-400 group-hover:text-neutral-600 flex-shrink-0 transition-transform ${
-                      expandedId === event.id ? 'rotate-90' : ''
-                    }`}
-                  />
-                </div>
-              </button>
-            ))}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

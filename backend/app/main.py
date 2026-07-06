@@ -7,6 +7,8 @@ import logging
 from app.config import settings
 from app.database import init_db, close_db
 from app.api import api_router
+from app.services.api_key_validation import validate_api_keys
+from app.services.external_health import probe_all_external_services, external_health_http_status
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +22,9 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database initialized")
+
+    logger.info("Validating external API keys...")
+    await validate_api_keys()
     
     yield
     
@@ -55,6 +60,19 @@ async def health_check():
         status_code=200,
         content={"status": "healthy", "version": settings.API_VERSION},
     )
+
+
+@app.get("/health/external")
+async def external_health_check():
+    """
+    Live probe of external dependencies (Semantic Scholar, PubMed, embeddings).
+
+    Semantic Scholar validation includes strict field checks on returned papers
+    (title, abstract, authors, year, citation_count, doi, open_access_pdf when applicable).
+    """
+    payload = await probe_all_external_services(full_s2_validation=True)
+    status_code = external_health_http_status(payload)
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 # Include API routes

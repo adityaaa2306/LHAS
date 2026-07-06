@@ -252,6 +252,7 @@ export interface MemoryOverview {
 
 export interface MemoryGraphNode {
   id: string;
+  node_type?: 'claim' | 'paper' | 'drug' | 'outcome' | 'entity' | string;
   label: string;
   statement: string;
   intervention_canonical: string;
@@ -290,7 +291,26 @@ export interface MemoryGraphResponse {
     total_edges: number;
     visible_edges: number;
     edge_type_breakdown: Record<string, number>;
+    claim_nodes?: number;
+    structural_edges?: number;
   };
+}
+
+export interface PipelineDiagnostics {
+  mission_id: string;
+  pipeline_stages: Record<string, number>;
+  stage_health: Record<string, string>;
+  contradiction_explanation: string;
+  paper_audits: Array<{
+    paper_id: string;
+    title: string;
+    stages: Record<string, boolean | number>;
+    claims_count: number;
+    entities_count: number;
+    entities?: string[];
+    failure_reason?: string | null;
+  }>;
+  graph_statistics: Record<string, number>;
 }
 
 export interface ClaimMemoryDetail {

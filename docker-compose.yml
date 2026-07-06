@@ -46,7 +46,9 @@ services:
       # Database connection - use service name 'postgres' not localhost
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-aditya}@postgres:5432/${POSTGRES_DB:-LHAS}
       GROBID_URL: http://grobid:8070
-      
+      # API keys (SEMANTIC_SCHOLAR, PUBMED, EMBEDDING, NVIDIA) are loaded from
+      # env_file above ONLY. Do NOT interpolate ${VAR} here — host shell env vars
+      # would override the .env file and silently inject stale keys.
       # CORS - include all frontend URLs
       CORS_ORIGINS: http://localhost:3000,http://localhost:5173,http://frontend:3000,http://frontend:80
     ports:

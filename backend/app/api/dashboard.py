@@ -3,9 +3,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Dict, Any, List
 from pydantic import BaseModel
+import json
 from app.database import get_db
 from app.services import DashboardService
-from app.models import ResearchPaper, PaperSource, ResearchClaim, SynthesisAnswer, ReasoningStep, MissionTimeline, ClaimTypeEnum
+from app.models import ResearchPaper, PaperSource, ResearchClaim, SynthesisAnswer, ReasoningStep, MissionTimeline, ClaimTypeEnum, Mission
 from app.services.claim_curation import build_mission_findings
 from app.services.synthesis_generation import SynthesisGenerationService
 
@@ -377,11 +378,11 @@ async def get_mission_timeline(
             .where(MissionTimeline.mission_id == mission_id)
             .order_by(MissionTimeline.occurred_at.desc())
         )
-        
+
         result = await db.execute(stmt)
         events = result.scalars().all()
-        
-        timeline_data = [
+
+        timeline_data: List[Dict[str, Any]] = [
             {
                 "id": str(event.id),
                 "event_type": event.event_type,
@@ -390,10 +391,39 @@ async def get_mission_timeline(
                 "cycle_number": event.cycle_number,
                 "metrics_change": event.metrics_change or {},
                 "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
+                "source": "mission_event",
+                "level": "info",
             }
             for event in events
         ]
-        
+
+        mission = await db.get(Mission, mission_id)
+        if mission and mission.ingestion_activity_log:
+            try:
+                activities = json.loads(mission.ingestion_activity_log)
+                for index, activity in enumerate(activities):
+                    message = (activity.get("message") or "").strip()
+                    if not message:
+                        continue
+                    timeline_data.append({
+                        "id": f"ingestion-log-{index}-{activity.get('timestamp', index)}",
+                        "event_type": "ingestion_log",
+                        "event_title": message,
+                        "event_description": None,
+                        "cycle_number": None,
+                        "metrics_change": {},
+                        "occurred_at": activity.get("timestamp"),
+                        "source": "ingestion",
+                        "level": activity.get("level", "info"),
+                    })
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        timeline_data.sort(
+            key=lambda item: item.get("occurred_at") or "",
+            reverse=True,
+        )
+
         return {
             "mission_id": mission_id,
             "timeline": timeline_data,

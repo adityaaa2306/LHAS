@@ -43,8 +43,10 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
   const [showHelp, setShowHelp] = React.useState(false);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
   const [transform, setTransform] = React.useState({ x: 0, y: 0, scale: 1 });
+  const [userFocusActive, setUserFocusActive] = React.useState(false);
 
   const panelRef = React.useRef<HTMLDivElement | null>(null);
+  const canvasContainerRef = React.useRef<HTMLDivElement | null>(null);
   const dragStateRef = React.useRef<{
     dragging: boolean;
     startX: number;
@@ -59,15 +61,28 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
   React.useEffect(() => {
     if (!nodes.length) {
       setSelectedNodeId(null);
+      setUserFocusActive(false);
       return;
     }
-    const bestNode = [...nodes].sort((left, right) => {
-      const leftScore = left.contradiction_count * 4 + left.edge_count * 2 + left.composite_confidence;
-      const rightScore = right.contradiction_count * 4 + right.edge_count * 2 + right.composite_confidence;
-      return rightScore - leftScore;
-    })[0];
-    setSelectedNodeId((current) => (current && nodes.some((node) => node.id === current) ? current : bestNode.id));
+    setSelectedNodeId((current) => (current && nodes.some((node) => node.id === current) ? current : null));
   }, [nodes]);
+
+  React.useEffect(() => {
+    const el = canvasContainerRef.current;
+    if (!el) return undefined;
+
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const delta = event.deltaY < 0 ? 1.08 : 0.92;
+      setTransform((current) => ({
+        ...current,
+        scale: clamp(current.scale * delta, 0.62, 2.4),
+      }));
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [nodes.length]);
 
   React.useEffect(() => {
     const handler = () => {
@@ -90,10 +105,10 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
     }
   }, [edgeFilter, edges]);
 
-  const filteredNodeIds = React.useMemo(() => {
-    if (!visibleEdges.length) return new Set(nodes.map((node) => node.id));
-    return new Set(visibleEdges.flatMap((edge) => [edge.source, edge.target]));
-  }, [visibleEdges, nodes]);
+  const filteredNodeIds = React.useMemo(
+    () => new Set(nodes.map((node) => node.id)),
+    [nodes],
+  );
 
   const connectedIds = React.useMemo(() => {
     const map = new Map<string, Set<string>>();
@@ -112,11 +127,11 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
   );
   const nodeMap = React.useMemo(() => new Map(layoutNodes.map((node) => [node.id, node])), [layoutNodes]);
 
-  const activeNodeId = hoveredNodeId || selectedNodeId;
+  const focusNodeId = userFocusActive ? (hoveredNodeId || selectedNodeId) : null;
   const neighborIds = React.useMemo(() => {
-    if (!activeNodeId) return new Set<string>();
-    return new Set([activeNodeId, ...(connectedIds.get(activeNodeId) || [])]);
-  }, [activeNodeId, connectedIds]);
+    if (!focusNodeId) return new Set<string>();
+    return new Set([focusNodeId, ...(connectedIds.get(focusNodeId) || [])]);
+  }, [focusNodeId, connectedIds]);
 
   const selectedNode = selectedNodeId ? nodeMap.get(selectedNodeId) || null : null;
   const selectedNodeEdges = React.useMemo(
@@ -131,6 +146,8 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
 
   const resetView = React.useCallback(() => {
     setTransform({ x: 0, y: 0, scale: 1 });
+    setUserFocusActive(false);
+    setSelectedNodeId(null);
   }, []);
 
   const toggleFullscreen = React.useCallback(async () => {
@@ -141,15 +158,6 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
     } else {
       await element.requestFullscreen();
     }
-  }, []);
-
-  const handleWheel = React.useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const delta = event.deltaY < 0 ? 1.08 : 0.92;
-    setTransform((current) => ({
-      ...current,
-      scale: clamp(current.scale * delta, 0.62, 2.4),
-    }));
   }, []);
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -351,8 +359,8 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
             </div>
 
             <div
+              ref={canvasContainerRef}
               className={`relative h-[75vh] min-h-[38rem] w-full touch-none select-none ${dragStateRef.current?.dragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-              onWheel={handleWheel}
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
@@ -372,34 +380,53 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
                     const source = nodeMap.get(edge.source);
                     const target = nodeMap.get(edge.target);
                     if (!source || !target) return null;
-                    const relatedToActive =
-                      !!activeNodeId && (edge.source === activeNodeId || edge.target === activeNodeId);
+                    const relatedToFocus =
+                      !!focusNodeId && (edge.source === focusNodeId || edge.target === focusNodeId);
+                    const midX = (source.x + target.x) / 2;
+                    const midY = (source.y + target.y) / 2;
+                    const isStructural = ['MENTIONS', 'DERIVED_FROM', 'ASSOCIATED_WITH'].includes(edge.edge_type);
                     return (
-                      <path
-                        key={edge.id}
-                        d={buildCurvedPath(source.x, source.y, target.x, target.y, edge.id)}
-                        fill="none"
-                        stroke={edgeColor(edge.edge_type)}
-                        strokeWidth={relatedToActive ? 3.8 : Math.max(1.4, edge.edge_weight * 4.4)}
-                        strokeOpacity={
-                          activeNodeId
-                            ? relatedToActive
-                              ? 0.96
-                              : 0.08
-                            : edge.edge_type === 'CONTRADICTS'
-                              ? 0.58
-                              : 0.22
-                        }
-                        strokeLinecap="round"
-                        className="transition-all duration-300"
-                      />
+                      <g key={edge.id}>
+                        <path
+                          d={buildCurvedPath(source.x, source.y, target.x, target.y, edge.id)}
+                          fill="none"
+                          stroke={edgeColor(edge.edge_type)}
+                          strokeWidth={
+                            relatedToFocus ? 3.8 : Math.max(1.8, isStructural ? 1.6 : edge.edge_weight * 4.4)
+                          }
+                          strokeOpacity={
+                            focusNodeId
+                              ? relatedToFocus
+                                ? 0.96
+                                : 0.18
+                              : edge.edge_type === 'CONTRADICTS'
+                                ? 0.78
+                                : isStructural
+                                  ? 0.42
+                                  : 0.58
+                          }
+                          strokeLinecap="round"
+                          className="transition-all duration-300"
+                        />
+                        {transform.scale >= 0.75 && (
+                          <text
+                            x={midX}
+                            y={midY - 4}
+                            textAnchor="middle"
+                            className="pointer-events-none select-none fill-neutral-500 text-[9px] font-medium uppercase tracking-wide"
+                            opacity={focusNodeId ? (relatedToFocus ? 0.9 : 0.15) : 0.55}
+                          >
+                            {formatEdgeLabel(edge.edge_type)}
+                          </text>
+                        )}
+                      </g>
                     );
                   })}
 
                   {layoutNodes.map((node) => {
                     const selected = selectedNodeId === node.id;
                     const hovered = hoveredNodeId === node.id;
-                    const inFocus = !activeNodeId || neighborIds.has(node.id) || node.id === activeNodeId;
+                    const inFocus = !focusNodeId || neighborIds.has(node.id);
                     const radius = nodeRadius(node);
                     return (
                       <g
@@ -412,6 +439,7 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
                         onClick={(event) => {
                           event.stopPropagation();
                           setSelectedNodeId(node.id);
+                          setUserFocusActive(true);
                         }}
                       >
                         {(selected || hovered) && (
@@ -431,8 +459,8 @@ export const MemoryGraphPanel: React.FC<MemoryGraphPanelProps> = ({
                         />
                         <circle
                           r={radius}
-                          fill={nodeColor(node.direction)}
-                          opacity={inFocus ? 0.96 : 0.18}
+                          fill={nodeFillColor(node)}
+                          opacity={inFocus ? 0.96 : 0.35}
                           stroke={selected ? '#ffffff' : node.contradiction_count > 0 ? '#c084fc' : 'rgba(255,255,255,0.55)'}
                           strokeWidth={selected ? 3 : node.contradiction_count > 0 ? 2.2 : 1.25}
                         />
@@ -763,7 +791,26 @@ function hashSeed(seed: string) {
 }
 
 function nodeRadius(node: MemoryGraphNode) {
-  return 7 + node.composite_confidence * 10 + Math.min(node.edge_count, 8) * 0.8;
+  const base = node.node_type === 'paper' ? 9 : node.node_type === 'claim' ? 7 : 6;
+  if (node.node_type === 'paper' || node.node_type === 'drug' || node.node_type === 'outcome') {
+    return base;
+  }
+  return base + node.composite_confidence * 10 + Math.min(node.edge_count, 8) * 0.8;
+}
+
+function nodeFillColor(node: MemoryGraphNode) {
+  switch (node.node_type) {
+    case 'paper':
+      return '#64748b';
+    case 'drug':
+      return '#3b82f6';
+    case 'outcome':
+      return '#f59e0b';
+    case 'entity':
+      return '#a78bfa';
+    default:
+      return nodeColor(node.direction);
+  }
 }
 
 function nodeColor(direction: MemoryGraphNode['direction']) {
@@ -791,9 +838,19 @@ function edgeColor(edgeType: string) {
       return '#f59e0b';
     case 'IS_SUBGROUP_OF':
       return '#cbd5e1';
+    case 'MENTIONS':
+      return '#a78bfa';
+    case 'DERIVED_FROM':
+      return '#94a3b8';
+    case 'ASSOCIATED_WITH':
+      return '#38bdf8';
     default:
       return '#cbd5e1';
   }
+}
+
+function formatEdgeLabel(edgeType: string) {
+  return edgeType.toLowerCase().replace(/_/g, ' ');
 }
 
 function buildWhyItMattersSummary(edges: MemoryGraphEdge[]) {

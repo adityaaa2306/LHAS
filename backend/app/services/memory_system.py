@@ -774,8 +774,6 @@ class MemorySystemService:
             ).scalars().all()
             paper_titles = {str(paper.id): paper.title for paper in paper_rows}
 
-        edge_type_breakdown = Counter(_enum_value(edge.edge_type, "UNKNOWN") for edge in selected_edges)
-
         nodes = []
         for node in selected_nodes:
             claim_id = str(node.claim_id)
@@ -787,6 +785,7 @@ class MemorySystemService:
             nodes.append(
                 {
                     "id": claim_id,
+                    "node_type": "claim",
                     "label": f"{intervention} -> {outcome}",
                     "statement": statement or f"{intervention} -> {outcome}",
                     "intervention_canonical": intervention,
@@ -819,6 +818,12 @@ class MemorySystemService:
             for edge in selected_edges
         ]
 
+        nodes, edges = self._enrich_graph_with_structural_nodes(
+            nodes, edges, claims_by_id, paper_titles, selected_ids
+        )
+
+        edge_type_breakdown = Counter(e["edge_type"] for e in edges)
+
         return {
             "mission_id": mission_id,
             "nodes": nodes,
@@ -829,8 +834,121 @@ class MemorySystemService:
                 "total_edges": len(edge_rows),
                 "visible_edges": len(edges),
                 "edge_type_breakdown": dict(edge_type_breakdown),
+                "claim_nodes": len(selected_nodes),
+                "structural_edges": len(edges) - len(selected_edges),
             },
         }
+
+    def _enrich_graph_with_structural_nodes(
+        self,
+        claim_nodes: List[Dict[str, Any]],
+        claim_edges: List[Dict[str, Any]],
+        claims_by_id: Dict[str, ResearchClaim],
+        paper_titles: Dict[str, str],
+        selected_claim_ids: set,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Add paper, entity, and structural edges so the graph is not isolated claim nodes."""
+        nodes = list(claim_nodes)
+        edges = list(claim_edges)
+        node_ids = {n["id"] for n in nodes}
+        edge_keys: set = {(e["source"], e["target"], e["edge_type"]) for e in edges}
+
+        def add_node(node: Dict[str, Any]) -> None:
+            if node["id"] not in node_ids:
+                nodes.append(node)
+                node_ids.add(node["id"])
+
+        def add_edge(source: str, target: str, edge_type: str, justification: str = "") -> None:
+            key = (source, target, edge_type)
+            if key in edge_keys or source not in node_ids or target not in node_ids:
+                return
+            edge_keys.add(key)
+            edges.append({
+                "id": f"struct_{source}_{target}_{edge_type}",
+                "source": source,
+                "target": target,
+                "edge_type": edge_type,
+                "edge_weight": 0.55,
+                "study_design_delta": 0.0,
+                "confidence_product": 0.0,
+                "recency_weight": 0.0,
+                "resolution_status": "structural",
+                "justification": justification,
+            })
+
+        entity_nodes: Dict[str, str] = {}
+
+        for claim_id in selected_claim_ids:
+            claim = claims_by_id.get(claim_id)
+            if not claim:
+                continue
+
+            paper_id = str(claim.paper_id) if claim.paper_id else None
+            if paper_id and f"paper:{paper_id}" not in node_ids:
+                add_node({
+                    "id": f"paper:{paper_id}",
+                    "node_type": "paper",
+                    "label": (paper_titles.get(paper_id) or "Source paper")[:60],
+                    "statement": paper_titles.get(paper_id) or "Source paper",
+                    "intervention_canonical": "",
+                    "outcome_canonical": "",
+                    "direction": "unclear",
+                    "claim_type": "paper",
+                    "composite_confidence": 0.0,
+                    "study_design_score": 0.0,
+                    "publication_year": None,
+                    "paper_title": paper_titles.get(paper_id),
+                    "edge_count": 0,
+                    "contradiction_count": 0,
+                    "topic_key": "paper",
+                })
+            if paper_id:
+                add_edge(claim_id, f"paper:{paper_id}", "DERIVED_FROM", "Claim extracted from paper")
+
+            for entity_name, entity_type in (
+                (claim.intervention_canonical, "drug"),
+                (claim.outcome_canonical, "outcome"),
+            ):
+                if not entity_name or not entity_name.strip():
+                    continue
+                entity_key = entity_name.strip().lower()
+                entity_id = f"entity:{entity_type}:{entity_key}"
+                entity_nodes[entity_id] = entity_name.strip()
+                if entity_id not in node_ids:
+                    add_node({
+                        "id": entity_id,
+                        "node_type": entity_type,
+                        "label": entity_name.strip(),
+                        "statement": entity_name.strip(),
+                        "intervention_canonical": entity_name if entity_type == "drug" else "",
+                        "outcome_canonical": entity_name if entity_type == "outcome" else "",
+                        "direction": "unclear",
+                        "claim_type": entity_type,
+                        "composite_confidence": 0.0,
+                        "study_design_score": 0.0,
+                        "publication_year": None,
+                        "edge_count": 0,
+                        "contradiction_count": 0,
+                        "topic_key": entity_key,
+                    })
+                add_edge(claim_id, entity_id, "MENTIONS", f"Claim mentions {entity_name}")
+
+        intervention_ids = [nid for nid in entity_nodes if nid.startswith("entity:drug:")]
+        outcome_ids = [nid for nid in entity_nodes if nid.startswith("entity:outcome:")]
+        for int_id in intervention_ids[:12]:
+            for out_id in outcome_ids[:12]:
+                add_edge(
+                    int_id,
+                    out_id,
+                    "ASSOCIATED_WITH",
+                    "Intervention associated with outcome in evidence base",
+                )
+
+        for node in nodes:
+            if node.get("node_type") is None:
+                node["node_type"] = "claim"
+
+        return nodes, edges
 
     async def get_latest_checkpoint(self, mission_id: str) -> Optional[Dict[str, Any]]:
         checkpoint = (
@@ -1039,6 +1157,8 @@ class MemorySystemService:
                 continue
             resolution = await self._resolve_edge_type_with_llm(claim, existing)
             if not resolution:
+                resolution = self._heuristic_edge_resolution(claim, existing)
+            if not resolution:
                 await self.log_event(
                     event_type=MemoryEventType.LINK_RESOLUTION_FAILED,
                     mission_id=claim.mission_id,
@@ -1141,6 +1261,51 @@ Return JSON only:
             except Exception as exc:
                 logger.warning("Link resolver failed for %s -> %s: %s", new_claim.id, existing_claim.id, exc)
         return None
+
+    def _heuristic_edge_resolution(
+        self, new_claim: ResearchClaim, existing_claim: ResearchClaim
+    ) -> Optional[Dict[str, str]]:
+        """Rule-based link resolution when LLM resolver fails."""
+        if not new_claim.intervention_canonical or not new_claim.outcome_canonical:
+            return None
+        if not existing_claim.intervention_canonical or not existing_claim.outcome_canonical:
+            return None
+
+        int_new = new_claim.intervention_canonical.strip().lower()
+        int_exist = existing_claim.intervention_canonical.strip().lower()
+        out_new = new_claim.outcome_canonical.strip().lower()
+        out_exist = existing_claim.outcome_canonical.strip().lower()
+
+        if int_new != int_exist or out_new != out_exist:
+            return None
+
+        d_new = _enum_value(new_claim.direction, "unclear").lower()
+        d_exist = _enum_value(existing_claim.direction, "unclear").lower()
+
+        if d_new == d_exist and d_new in {"positive", "negative", "null"}:
+            return {
+                "edge_type": GraphEdgeType.SUPPORTS.value,
+                "justification": "Same intervention-outcome pair with aligned evidence direction.",
+            }
+        if {d_new, d_exist} == {"positive", "negative"}:
+            return None
+
+        pop_new = (new_claim.population or "").strip().lower()
+        pop_exist = (existing_claim.population or "").strip().lower()
+        if pop_new and pop_exist and pop_new != pop_exist:
+            return {
+                "edge_type": GraphEdgeType.REFINES.value,
+                "justification": "Same intervention-outcome pair with different populations.",
+            }
+        if d_new != d_exist:
+            return {
+                "edge_type": GraphEdgeType.REFINES.value,
+                "justification": "Related findings on the same intervention-outcome pair.",
+            }
+        return {
+            "edge_type": GraphEdgeType.SUPPORTS.value,
+            "justification": "Claims share the same intervention-outcome entity pair.",
+        }
 
     async def _create_or_update_edge(
         self,

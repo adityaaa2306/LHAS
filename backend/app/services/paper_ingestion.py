@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional, Dict, List, Tuple
@@ -22,6 +23,8 @@ from app.services.belief_revision import BeliefRevisionService
 from app.services.contradiction_handling import ContradictionHandlingService
 from app.services.memory_system import MemorySystemService
 from app.services.synthesis_generation import SynthesisGenerationService
+from app.services.ingestion_progress import IngestionProgressTracker
+from app.services.research_retrieval import ResearchRetrievalEngine
 from app.models.memory import RawPaperStatus, SynthesisTrigger
 import time
 
@@ -102,11 +105,104 @@ class IngestionConfig:
     relevance_threshold: float = 0.5
     sources: List[str] = None
     mmr_lambda: float = 0.8  # Increased from 0.6 to prioritize relevance (80%) over diversity (20%)
-    min_abstract_length: int = 100
+    min_abstract_length: int = 50
     
     def __post_init__(self):
         if self.sources is None:
             self.sources = ["arxiv", "semantic_scholar", "pubmed"]
+
+
+_SEARCH_STOPWORDS = frozenset({
+    "what", "are", "the", "long", "term", "effects", "our", "bodies", "how", "does",
+    "do", "is", "a", "an", "on", "of", "for", "and", "or", "in", "to", "with",
+    "about", "from", "that", "this", "human", "body", "impact", "over", "time",
+})
+
+MIN_RETRIEVAL_CANDIDATES = 25
+MAX_RETRIEVAL_QUERIES = 8
+
+
+def _extract_keyword_terms(text: str, key_concepts: Optional[List[str]] = None) -> List[str]:
+    """Pull short keyword phrases suitable for PubMed / S2 (not full NL questions)."""
+    terms: List[str] = []
+    seen: set = set()
+
+    def add(term: str) -> None:
+        t = re.sub(r"\s+", " ", (term or "").strip())
+        if not t or len(t) < 3:
+            return
+        key = t.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append(t)
+
+    for concept in key_concepts or []:
+        add(concept)
+
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", text or ""):
+        if token.lower() not in _SEARCH_STOPWORDS:
+            add(token)
+
+    if key_concepts and len(key_concepts) >= 2:
+        add(" ".join(key_concepts[:3]))
+
+    # Common drug synonym for ozempic missions
+    lower = (text or "").lower()
+    if "ozempic" in lower and not any("semaglutide" in t.lower() for t in terms):
+        add("semaglutide long term effects")
+
+    return terms
+
+
+def build_retrieval_queries(
+    base_query: str,
+    expanded_queries: List[str],
+    key_concepts: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Build search queries with keyword-first ordering.
+
+    PubMed and Semantic Scholar perform poorly on conversational questions like
+    'what are the long term effects of ozempic on our bodies?' — keyword queries first.
+    """
+    queries: List[str] = []
+    seen: set = set()
+
+    def add(q: str) -> None:
+        q = re.sub(r"\s+", " ", (q or "").strip())
+        if not q:
+            return
+        k = q.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        queries.append(q)
+
+    for term in _extract_keyword_terms(base_query, key_concepts):
+        add(term)
+
+    for q in expanded_queries or []:
+        add(q)
+
+    add(base_query)
+
+    return queries[:MAX_RETRIEVAL_QUERIES]
+
+
+def sanitize_pubmed_query(query: str) -> str:
+    """Convert conversational questions into PubMed-friendly term queries."""
+    q = (query or "").strip()
+    if not q:
+        return q
+    if "?" in q or re.match(r"^(what|how|why|when|where|which)\b", q, re.I):
+        words = [
+            w for w in re.findall(r"\b[\w-]+\b", q.lower())
+            if w not in _SEARCH_STOPWORDS and len(w) > 2
+        ]
+        if words:
+            return " AND ".join(words[:8])
+    return q
 
 
 class ArxivConnector:
@@ -129,12 +225,15 @@ class ArxivConnector:
         Implemented as 0.25 req/sec (4 second intervals)
         """
         async def _do_search():
-            # Build search query - simpler format for better matching
-            keywords = query.split()
-            if len(keywords) > 1:
-                search_query = "+AND+".join(keywords)
+            # Build search query — quote phrases, use all: field for arXiv
+            q = query.strip()
+            if not q:
+                return []
+            if " " in q:
+                keywords = [w for w in q.split() if len(w) > 1]
+                search_query = "+AND+".join(f"all:{w}" for w in keywords[:6])
             else:
-                search_query = keywords[0] if keywords else query
+                search_query = f"all:{q}"
             
             params = {
                 'search_query': search_query,
@@ -245,94 +344,67 @@ class ArxivConnector:
 
 
 class SemanticScholarConnector:
-    """Semantic Scholar API connector with rate limiting and retry logic."""
-    
-    BASE_URL = "https://api.semanticscholar.org/graph/v1"
-    
+    """Semantic Scholar connector — delegates to production Graph API client."""
+
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.headers = {}
-        if api_key:
-            self.headers['x-api-key'] = api_key
-        
-        # Import rate limiter
-        from app.services.rate_limiter import SemanticScholarRateLimiter
-        self.rate_limiter = SemanticScholarRateLimiter(is_authenticated=bool(api_key))
-    
+        from app.services.semantic_scholar import SemanticScholarClient, normalize_api_key
+        self._client = SemanticScholarClient(normalize_api_key(api_key))
+
+    @property
+    def auth_mode(self):
+        return self._client.auth_mode
+
     async def search(self, query: str, max_results: int = 100) -> List[PaperObject]:
-        """
-        Search Semantic Scholar for papers with rate limiting and retry logic.
-        
-        Rate limits:
-        - Unauthenticated: 100 req/5min → 0.2 req/sec (5s intervals)
-        - Authenticated: 1 req/sec (conservative)
-        """
-        async def _do_search():
-            endpoint = f"{self.BASE_URL}/paper/search"
-            params = {
-                'query': query,
-                'limit': min(max_results, 100),
-                'fields': 'paperId,title,abstract,authors,year,externalIds,url,citationCount,openAccessPdf'
-            }
-            
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(
-                    endpoint,
-                    params=params,
-                    headers=self.headers,
-                )
-                response.raise_for_status()
-            
-            return response.json()
-        
-        try:
-            data = await self.rate_limiter.request(_do_search)
-            papers = self._parse_semantic_scholar_response(data)
-            logger.info(f"Semantic Scholar: Retrieved {len(papers)} papers for query '{query}'")
-            return papers
-            
-        except Exception as e:
-            logger.error(f"Semantic Scholar retrieval error for query '{query}': {str(e)}")
+        from app.services.semantic_scholar import parse_paper_item, SemanticScholarError
+
+        result = await self._client.search(query, max_results=max_results)
+        if not result.success:
+            err = result.error or SemanticScholarError("Unknown Semantic Scholar error")
+            logger.error(
+                "Semantic Scholar search failed query=%r auth=%s latency_ms=%.0f error=%s",
+                query[:60],
+                result.metrics.auth_mode.value,
+                result.metrics.latency_ms,
+                err,
+            )
             return []
-    
-    def _parse_semantic_scholar_response(self, data: dict) -> List[PaperObject]:
-        """Parse Semantic Scholar API response."""
-        papers = []
-        try:
-            for item in data.get('data', []):
-                try:
-                    paper_id = item.get('paperId')
-                    title = item.get('title')
-                    abstract = item.get('abstract') or ''
-                    year = item.get('year')
-                    
-                    authors = [author.get('name') for author in item.get('authors', [])]
-                    
-                    external_ids = item.get('externalIds', {}) or {}
-                    doi = external_ids.get('DOI')
-                    
-                    paper = PaperObject(
-                        paper_id=f"semanticscholar_{paper_id}",
-                        title=title,
-                        authors=authors,
-                        abstract=abstract,
-                        year=year,
-                        source=PaperSource.SEMANTIC_SCHOLAR,
-                        doi=doi,
-                        url=item.get('url'),
-                        pdf_url=(item.get('openAccessPdf') or {}).get('url'),
-                        citations_count=item.get('citationCount'),
-                        influence_score=item.get('influenceScore'),
-                    )
-                    papers.append(paper)
-                except Exception as e:
-                    logger.debug(f"Error parsing Semantic Scholar entry: {str(e)}")
+
+        papers: List[PaperObject] = []
+        for item in result.raw_items:
+            try:
+                parsed = parse_paper_item(item)
+                paper_id = parsed.get("paper_id")
+                if not paper_id or not parsed.get("title"):
                     continue
-            
-            return papers
-        except Exception as e:
-            logger.error(f"Error parsing Semantic Scholar response: {str(e)}")
-            return []
+                papers.append(PaperObject(
+                    paper_id=f"semanticscholar_{paper_id}",
+                    title=parsed["title"],
+                    authors=parsed["authors"],
+                    abstract=parsed["abstract"],
+                    year=parsed["year"],
+                    source=PaperSource.SEMANTIC_SCHOLAR,
+                    doi=parsed.get("doi"),
+                    url=parsed.get("url"),
+                    pdf_url=parsed.get("pdf_url"),
+                    citations_count=parsed.get("citations_count"),
+                    influence_score=parsed.get("influential_citation_count"),
+                    keywords=parsed.get("fields_of_study") or [],
+                ))
+            except Exception as e:
+                logger.warning("Semantic Scholar parse error: %s", e)
+                continue
+
+        logger.info(
+            "Semantic Scholar: %d papers for '%s' (total_available=%s, latency_ms=%.0f)",
+            len(papers),
+            query[:50],
+            result.metrics.total_available,
+            result.metrics.latency_ms,
+        )
+        return papers
+
+    async def close(self) -> None:
+        await self._client.close()
 
 
 class PubMedConnector:
@@ -356,11 +428,15 @@ class PubMedConnector:
         - Without API key: 3 req/sec (conservative: 2 req/sec)
         - With API key: 10 req/sec (conservative: 5 req/sec)
         """
+        pubmed_term = sanitize_pubmed_query(query)
+        if pubmed_term != query:
+            logger.debug("PubMed query sanitized: %r -> %r", query[:60], pubmed_term[:60])
+
         async def _do_search():
             # Step 1: Search to get PMIDs
             search_params = {
                 'db': 'pubmed',
-                'term': query,
+                'term': pubmed_term,
                 'retmax': min(max_results, 1000),
                 'tool': 'lhas',
                 'email': 'lhas@research.local'
@@ -394,7 +470,7 @@ class PubMedConnector:
             # Step 2: Fetch detailed records
             fetch_params = {
                 'db': 'pubmed',
-                'id': ','.join(pmids[:50]),  # Limit to 50 per fetch
+                'id': ','.join(pmids[:100]),  # Limit to 100 per fetch
                 'rettype': 'medline',
                 'retmode': 'text',
                 'tool': 'lhas',
@@ -678,8 +754,10 @@ class PaperIngestionService:
         db: AsyncSession,
         semantic_scholar_api_key: Optional[str] = None,
         pubmed_api_key: Optional[str] = None,
+        progress_tracker: Optional[IngestionProgressTracker] = None,
     ):
         self.db = db
+        self.progress = progress_tracker
         self.arxiv = ArxivConnector()
         self.semantic_scholar = SemanticScholarConnector(semantic_scholar_api_key)
         self.pubmed = PubMedConnector(pubmed_api_key)
@@ -721,31 +799,96 @@ class PaperIngestionService:
         start_time = time.time()
         
         try:
-            # STAGE 1: Query expansion
-            logger.info(f"[{batch_id}] Stage 1: Query expansion")
-            expanded_queries, concept_clusters = await self._stage1_query_expansion(structured_query)
+            # STAGES 1–2: Retrieval planner + parallel evidence retrieval
+            logger.info(f"[{batch_id}] Stages 1–2: Research retrieval engine")
+            retrieval_engine = ResearchRetrievalEngine(
+                pubmed=self.pubmed,
+                semantic_scholar=self.semantic_scholar,
+                arxiv=self.arxiv,
+                llm_provider=self.llm_provider,
+                embedding_service=self.embedding_service,
+                progress=self.progress,
+            )
+            candidates, retrieval_report = await retrieval_engine.retrieve(structured_query, config)
+            expanded_queries = [s.query for s in retrieval_report.plan.searches]
+            concept_clusters = {
+                e.name: e.synonyms for e in retrieval_report.plan.entities
+            }
+            logger.info(
+                f"[{batch_id}] Retrieval complete: {len(candidates)} candidates, "
+                f"confidence={retrieval_report.confidence_score:.2f}, "
+                f"searches={len(retrieval_report.executions)}"
+            )
+            if self.progress:
+                self.progress.update_stats(
+                    candidates_retrieved=len(candidates),
+                    retrieval_plan=retrieval_report.to_dict(),
+                )
+            await asyncio.sleep(0)
             
-            # STAGE 2: Multi-source retrieval
-            logger.info(f"[{batch_id}] Stage 2: Multi-source retrieval")
-            candidates = await self._stage2_retrieval(expanded_queries, config)
-            logger.info(f"[{batch_id}] Total candidates: {len(candidates)}")
-            
-            # STAGE 3: Deduplication & normalization
+            # STAGE 3: Deduplication & normalization (CPU-bound — run off event loop)
+            if self.progress:
+                await self.progress.set_stage(
+                    "deduplicating",
+                    detail=f"Deduplicating {len(candidates)} papers",
+                    progress=18,
+                )
             logger.info(f"[{batch_id}] Stage 3: Deduplication & normalization")
-            deduplicated = self._stage3_deduplication(candidates)
+            loop = asyncio.get_running_loop()
+            deduplicated = await loop.run_in_executor(None, self._stage3_deduplication, candidates)
             logger.info(f"[{batch_id}] After deduplication: {len(deduplicated)}")
+            if self.progress:
+                await self.progress.set_stage(
+                    "deduplicating",
+                    detail=f"{len(deduplicated)} unique papers after dedup",
+                    progress=22,
+                    activity=f"Deduplicated to {len(deduplicated)} unique papers",
+                )
+                self.progress.update_stats(after_dedup=len(deduplicated))
+            await asyncio.sleep(0)
             
             # STAGE 4: Cheap prefiltering
+            if self.progress:
+                await self.progress.set_stage(
+                    "creating_embeddings",
+                    detail="Generating embeddings for prefilter",
+                    progress=25,
+                    activity="Creating embeddings for candidate papers...",
+                )
             logger.info(f"[{batch_id}] Stage 4: Cheap prefiltering")
             prefiltered = await self._stage4_prefilter(deduplicated, structured_query, config)
             logger.info(f"[{batch_id}] After prefilter: {len(prefiltered)}")
+            if self.progress:
+                await self.progress.set_stage(
+                    "creating_embeddings",
+                    detail=f"{len(prefiltered)} papers passed prefilter",
+                    progress=35,
+                    activity=f"Embeddings created — {len(prefiltered)} papers selected",
+                )
+                self.progress.update_stats(after_prefilter=len(prefiltered))
+            await asyncio.sleep(0)
             
-            # STAGE 5: Full-text CEGC scoring (deterministic layers + selective LLM verification)
+            # STAGE 5: Full-text CEGC scoring
+            if self.progress:
+                await self.progress.set_stage(
+                    "downloading_pdfs",
+                    detail=f"Downloading PDFs for {len(prefiltered)} papers",
+                    progress=38,
+                    activity="Downloading PDFs for full-text analysis...",
+                )
             logger.info(f"[{batch_id}] Stage 5: Full-text CEGC scoring")
             scored, llm_calls, llm_tokens = await self._stage5_cegc_soft_scoring(
                 prefiltered, structured_query, config
             )
             logger.info(f"[{batch_id}] After CEGC soft scoring: {len(scored)}")
+            if self.progress:
+                await self.progress.set_stage(
+                    "scoring_papers",
+                    detail=f"CEGC scored {len(scored)} papers",
+                    progress=65,
+                    activity=f"Scored {len(scored)} papers with CEGC pipeline",
+                )
+            await asyncio.sleep(0)
             
             # STAGE 6: CEGC Deep Analysis (Layer 5, selective LLM) - SKIPPED FOR PERFORMANCE
             # Layer 5 LLM verification only adds ±0.05 adjustment for edge cases
@@ -759,18 +902,40 @@ class PaperIngestionService:
             logger.info(f"[{batch_id}] Stage 7: MMR selection")
             selected = await self._stage7_mmr_selection(scored, config)
             logger.info(f"[{batch_id}] Final selected: {len(selected)}")
+            if self.progress:
+                self.progress.update_stats(selected=len(selected))
+                await self.progress.set_stage(
+                    "scoring_papers",
+                    detail=f"{len(selected)} papers selected for ingestion",
+                    progress=66,
+                    activity=f"Selected {len(selected)} of {len(scored)} scored papers",
+                )
             
             # STAGE 8: Full-text decision
             logger.info(f"[{batch_id}] Stage 8: Full-text decision")
             selected = self._stage8_fulltext_decision(selected)
             
             # STAGE 9: Database storage
+            if self.progress:
+                await self.progress.set_stage(
+                    "storing_papers",
+                    detail=f"Storing {len(selected)} papers",
+                    progress=68,
+                    activity=f"Storing {len(selected)} selected papers in database...",
+                )
             logger.info(f"[{batch_id}] Stage 9: Database storage")
             await self._stage9_database_storage(mission_id, batch_id, selected, structured_query)
             
-            # STAGE 10: FAISS indexing
+            # STAGE 10: FAISS indexing (CPU-bound — run off event loop)
+            if self.progress:
+                await self.progress.set_stage(
+                    "storing_vectors",
+                    detail="Building vector index",
+                    progress=74,
+                    activity="Storing vectors in FAISS index...",
+                )
             logger.info(f"[{batch_id}] Stage 10: FAISS indexing")
-            await self._stage10_faiss_indexing(mission_id, selected)
+            await loop.run_in_executor(None, self._stage10_faiss_indexing_sync, mission_id, selected)
             
             # STAGE 11: Ingestion event recording
             logger.info(f"[{batch_id}] Stage 11: Recording ingestion event")
@@ -782,9 +947,17 @@ class PaperIngestionService:
             )
             
             # STAGE 12: CLAIM EXTRACTION (NEW)
-            # Extract claims from all selected papers asynchronously
             logger.info(f"[{batch_id}] Stage 12: Claim extraction starting for {len(selected)} papers")
-            logger.info(f"🎯 [CLAIM EXTRACTION] Starting extraction for mission {mission_id}...")
+            if self.progress:
+                await self.progress.set_stage(
+                    "creating_claims",
+                    detail=f"Extracting claims from {len(selected)} papers",
+                    progress=78,
+                    activity="Creating claims from ingested papers...",
+                )
+                await self.progress.set_background_task(
+                    "claims", status="running", progress=10, detail="Extracting claims from papers..."
+                )
             
             try:
                 # Fetch mission data for context
@@ -842,6 +1015,30 @@ class PaperIngestionService:
                             
                             extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
                             
+                            for paper_obj, result in zip(papers_to_extract, extraction_results):
+                                if isinstance(result, Exception):
+                                    logger.warning(
+                                        "Exception during claim extraction for %s: %s",
+                                        paper_obj.paper_id,
+                                        result,
+                                    )
+                                    continue
+                                if not isinstance(result, dict):
+                                    continue
+                                audit = result.get("processing_audit") or {}
+                                if audit:
+                                    logger.info(
+                                        "[PAPER PIPELINE] %s | dl=%s parse=%s chunks=%s emb=%s claims=%s ent=%s%s",
+                                        audit.get("paper_id", paper_obj.paper_id),
+                                        "✓" if audit.get("downloaded") else "✗",
+                                        "✓" if audit.get("parsed") else "✗",
+                                        audit.get("chunks_created", 0),
+                                        "✓" if audit.get("embeddings_generated") else "✗",
+                                        audit.get("claims_extracted", 0),
+                                        audit.get("entities_extracted", 0),
+                                        f" | FAIL: {audit['failure_reason']}" if audit.get("failure_reason") else "",
+                                    )
+
                             # Count extracted claims
                             for result in extraction_results:
                                 if isinstance(result, dict) and result.get('success'):
@@ -873,23 +1070,42 @@ class PaperIngestionService:
                             try:
                                 processed_batches = (batch_start // batch_size) + 1
                                 total_batches = max(1, math.ceil(len(selected) / batch_size))
-                                extraction_progress = 60 + int((processed_batches / total_batches) * 30)
-                                extraction_progress = min(extraction_progress, 90)
-                                await self.db.execute(
-                                    update(Mission)
-                                    .where(Mission.id == mission_id)
-                                    .values(
-                                        ingestion_status="processing",
-                                        ingestion_progress=extraction_progress,
+                                extraction_progress = 78 + int((processed_batches / total_batches) * 10)
+                                extraction_progress = min(extraction_progress, 88)
+                                if self.progress:
+                                    await self.progress.set_progress(
+                                        extraction_progress,
+                                        detail=f"Extracted claims from {processed_batches}/{total_batches} papers",
                                     )
-                                )
-                                await self.db.commit()
+                                    await self.progress.set_background_task(
+                                        "claims",
+                                        status="running",
+                                        progress=int((processed_batches / total_batches) * 100),
+                                        detail=f"Paper {processed_batches}/{total_batches} processed",
+                                    )
+                                await asyncio.sleep(0)
                             except Exception as progress_err:
                                 logger.debug(
                                     f"[{batch_id}] Failed to update ingestion progress during extraction: {progress_err}"
                                 )
                     
                     logger.info(f"🎯 [CLAIM EXTRACTION] ✅ Total {total_claims_extracted} claims extracted and stored in database")
+                    if self.progress:
+                        await self.progress.set_background_task(
+                            "claims",
+                            status="completed",
+                            progress=100,
+                            detail=f"{total_claims_extracted} claims extracted",
+                        )
+                        await self.progress.set_stage(
+                            "detecting_contradictions",
+                            detail="Running contradiction detection",
+                            progress=88,
+                            activity=f"Extracted {total_claims_extracted} claims — detecting contradictions...",
+                        )
+                        await self.progress.set_background_task(
+                            "contradictions", status="running", progress=20, detail="Scanning for contradictions..."
+                        )
                     logger.info(f"[{batch_id}] Stage 12: Claim extraction completed - {total_claims_extracted} total claims extracted")
                     
                     # Commit all accumulated claims to database
@@ -906,8 +1122,37 @@ class PaperIngestionService:
                             await self.db.commit()
                             logger.info(
                                 f"[{batch_id}] Stage 12: Contradiction handling completed - "
-                                f"{contradiction_result.get('confirmed_contradictions', 0)} confirmed"
+                                f"{contradiction_result.get('confirmed_contradictions', 0)} confirmed, "
+                                f"{contradiction_result.get('candidate_pairs_evaluated', 0)} candidates evaluated"
                             )
+                            if self.progress:
+                                explanation = contradiction_result.get("explanation", "")
+                                await self.progress.set_background_task(
+                                    "contradictions",
+                                    status="completed",
+                                    progress=100,
+                                    detail=(
+                                        f"{contradiction_result.get('confirmed_contradictions', 0)} confirmed · "
+                                        f"{contradiction_result.get('candidate_pairs_evaluated', 0)} candidates"
+                                    ),
+                                )
+                                if explanation:
+                                    self.progress._log_activity_sync(explanation[:300])
+                                try:
+                                    from app.services.pipeline_diagnostics import PipelineDiagnosticsService
+                                    diag = PipelineDiagnosticsService(self.db)
+                                    pipeline_diag = await diag.get_mission_diagnostics(mission_id)
+                                    self.progress.update_stats(pipeline_diagnostics=pipeline_diag)
+                                except Exception as diag_exc:
+                                    logger.warning("Pipeline diagnostics failed: %s", diag_exc)
+                                await self.progress.set_stage(
+                                    "generating_synthesis",
+                                    detail="Generating mission synthesis",
+                                    progress=92,
+                                )
+                                await self.progress.set_background_task(
+                                    "synthesis", status="running", progress=30, detail="Generating synthesis..."
+                                )
                         except Exception as contradiction_exc:
                             logger.warning(f"[{batch_id}] Stage 12: Contradiction handling failed: {str(contradiction_exc)}")
                             await self.db.rollback()
@@ -944,11 +1189,25 @@ class PaperIngestionService:
                                     logger.info(
                                         f"[{batch_id}] Stage 12: Synthesis generated via {synthesis_trigger.value}"
                                     )
+                                    if self.progress:
+                                        await self.progress.set_background_task(
+                                            "synthesis", status="completed", progress=100,
+                                            detail="Synthesis generated",
+                                        )
                                 except Exception as synthesis_exc:
                                     logger.warning(
                                         f"[{batch_id}] Stage 12: Synthesis generation failed: {str(synthesis_exc)}"
                                     )
                                     await self.db.rollback()
+                            if self.progress:
+                                await self.progress.set_stage(
+                                    "building_memory",
+                                    detail="Building memory graph and relationships",
+                                    progress=95,
+                                )
+                                await self.progress.set_background_task(
+                                    "memory", status="running", progress=40, detail="Building relationships..."
+                                )
                             await self.memory_system.finalize_cycle(
                                 mission_id=mission_id,
                                 trigger=synthesis_trigger or SynthesisTrigger.NEW_PAPER,
@@ -956,6 +1215,28 @@ class PaperIngestionService:
                             )
                             await self.db.commit()
                             logger.info(f"[{batch_id}] Stage 12: Memory cycle finalized")
+                            if self.progress:
+                                await self.progress.set_background_task(
+                                    "memory", status="completed", progress=100, detail="Memory graph updated"
+                                )
+                                try:
+                                    from app.services.pipeline_diagnostics import PipelineDiagnosticsService
+                                    diag = PipelineDiagnosticsService(self.db)
+                                    pipeline_diag = await diag.get_mission_diagnostics(mission_id)
+                                    self.progress.update_stats(pipeline_diagnostics=pipeline_diag)
+                                    stages = pipeline_diag.get("pipeline_stages", {})
+                                    self.progress._log_activity_sync(
+                                        f"Pipeline complete: {stages.get('claims_extracted', 0)} claims, "
+                                        f"{stages.get('memory_graph_edges', 0)} edges, "
+                                        f"{stages.get('confirmed_contradictions', 0)} contradictions"
+                                    )
+                                except Exception:
+                                    pass
+                                for task_id in ("monitoring", "timeline", "reasoning"):
+                                    await self.progress.set_background_task(
+                                        task_id, status="completed", progress=100,
+                                        detail="Ready — refresh to view",
+                                    )
                         except Exception as memory_exc:
                             logger.warning(f"[{batch_id}] Stage 12: Memory finalization failed: {str(memory_exc)}")
                             await self.db.rollback()
@@ -1028,45 +1309,140 @@ Return JSON only:
                 data = json.loads(json_match.group())
                 variants = data.get('variants', [query_text])
                 clusters = data.get('concept_clusters', {})
-                return variants, clusters
+                # Always search the original query first
+                if query_text and query_text not in variants:
+                    variants = [query_text] + variants
+                return variants[:8], clusters
         except Exception as e:
-            logger.warning(f"Query expansion failed, using base query: {str(e)}")
+            logger.warning(f"Query expansion failed, using keyword fallback: {str(e)}")
         
-        return [query_text], {}
+        return self._fallback_query_expansion(query_text, concepts)
     
-    async def _stage2_retrieval(self, expanded_queries: list, config: IngestionConfig) -> List[PaperObject]:
-        """STAGE 2: Multi-source parallel retrieval with rate limiting.
-        
-        Now uses concurrent requests with per-source rate limiting (retry logic
-        handles 429s automatically with exponential backoff).
-        """
-        candidates = []
-        per_source = config.max_candidates // len(config.sources)
-        
-        # Process queries - run each query's sources in parallel
-        for query in expanded_queries[:3]:  # Use top 3 expanded queries
+    def _fallback_query_expansion(self, query_text: str, concepts: list) -> tuple:
+        """Keyword-based variants when LLM expansion is unavailable."""
+        variants = _extract_keyword_terms(query_text, concepts)
+        if query_text and query_text not in variants:
+            variants.append(query_text)
+        if not variants:
+            variants = [query_text] if query_text else []
+        return variants[:8], {}
+    
+    async def _stage2_retrieval(
+        self,
+        expanded_queries: list,
+        config: IngestionConfig,
+        base_query: str = "",
+        key_concepts: Optional[List[str]] = None,
+    ) -> List[PaperObject]:
+        """Multi-source retrieval with live progress — PubMed first for medical topics."""
+        candidates: List[PaperObject] = []
+        per_source = max(40, config.max_candidates // max(len(config.sources), 1))
+
+        queries = build_retrieval_queries(base_query, expanded_queries, key_concepts)
+        logger.info("Retrieval queries (%d): %s", len(queries), [q[:50] for q in queries])
+
+        source_order = []
+        for name in ("pubmed", "semantic_scholar", "arxiv"):
+            if name in config.sources:
+                source_order.append(name)
+
+        source_counts: Dict[str, int] = {}
+        total_q = len(queries)
+
+        for qi, query in enumerate(queries):
             tasks = []
-            
-            if 'arxiv' in config.sources:
-                tasks.append(('arxiv', self.arxiv.search(query, per_source)))
-            
-            if 'semantic_scholar' in config.sources:
-                # Now run in parallel with automatic retry on 429
-                tasks.append(('semantic_scholar', self.semantic_scholar.search(query, per_source)))
-            
-            if 'pubmed' in config.sources:
-                tasks.append(('pubmed', self.pubmed.search(query, per_source)))
-            
-            # Execute all source queries in parallel
-            if tasks:
-                results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
-                for (source_name, _), result in zip(tasks, results):
-                    if isinstance(result, Exception):
-                        logger.warning(f"{source_name} retrieval for query '{query}': {str(result)}")
-                        continue
-                    candidates.extend(result)
-        
+            if "pubmed" in source_order:
+                tasks.append(("pubmed", self.pubmed.search(query, per_source)))
+            if "semantic_scholar" in source_order:
+                tasks.append(("semantic_scholar", self.semantic_scholar.search(query, per_source)))
+            if "arxiv" in source_order:
+                tasks.append(("arxiv", self.arxiv.search(query, per_source)))
+
+            if not tasks:
+                continue
+
+            results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+            batch_added = 0
+            for (source_name, _), result in zip(tasks, results):
+                if isinstance(result, Exception):
+                    logger.warning("%s retrieval for '%s': %s", source_name, query[:40], result)
+                    if self.progress:
+                        self.progress._log_activity_sync(
+                            f"{source_name} error for '{query[:30]}' — {str(result)[:80]}",
+                            level="warning",
+                        )
+                    continue
+                count = len(result)
+                source_counts[source_name] = source_counts.get(source_name, 0) + count
+                candidates.extend(result)
+                batch_added += count
+                if self.progress and count > 0:
+                    self.progress._log_activity_sync(
+                        f"{source_name}: +{count} papers for \"{query[:50]}\""
+                    )
+
+            if self.progress:
+                self.progress.update_stats(
+                    candidates_retrieved=len(candidates),
+                    source_counts=source_counts,
+                )
+                await self.progress.set_stage(
+                    "searching_papers",
+                    detail=f"{len(candidates)} candidates · query {qi + 1}/{total_q}",
+                    progress=8 + int(((qi + 1) / total_q) * 10),
+                )
+            await asyncio.sleep(0)
+
+        logger.info(
+            "Retrieval complete: %d candidates | sources=%s",
+            len(candidates),
+            source_counts,
+        )
+
+        if len(candidates) < MIN_RETRIEVAL_CANDIDATES:
+            logger.warning(
+                "Low candidate count (%d < %d) — running keyword fallback searches",
+                len(candidates),
+                MIN_RETRIEVAL_CANDIDATES,
+            )
+            fallback_queries = _extract_keyword_terms(base_query, key_concepts)[:4]
+            for fq in fallback_queries:
+                if fq in queries:
+                    continue
+                logger.info("Fallback retrieval for: %r", fq)
+                extra = await self._retrieve_for_query(fq, config, per_source)
+                candidates.extend(extra)
+                if len(candidates) >= MIN_RETRIEVAL_CANDIDATES:
+                    break
+            candidates = self._stage3_deduplication(candidates)
+            logger.info("After fallback retrieval: %d candidates", len(candidates))
+
         return candidates
+
+    async def _retrieve_for_query(
+        self,
+        query: str,
+        config: IngestionConfig,
+        per_source: int,
+    ) -> List[PaperObject]:
+        """Run all configured sources for a single query string."""
+        papers: List[PaperObject] = []
+        tasks = []
+        if "pubmed" in config.sources:
+            tasks.append(self.pubmed.search(query, per_source))
+        if "semantic_scholar" in config.sources:
+            tasks.append(self.semantic_scholar.search(query, per_source))
+        if "arxiv" in config.sources:
+            tasks.append(self.arxiv.search(query, per_source))
+        if not tasks:
+            return papers
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("Fallback retrieval error for %r: %s", query[:40], result)
+                continue
+            papers.extend(result)
+        return papers
     
     def _stage3_deduplication(self, papers: List[PaperObject]) -> List[PaperObject]:
         """STAGE 3: Deduplication by DOI and title similarity"""
@@ -1094,8 +1470,14 @@ Return JSON only:
         config: IngestionConfig
     ) -> List[PaperObject]:
         """STAGE 4: Prefiltering using embedding similarity + keywords"""
-        # Filter by abstract length
-        papers = [p for p in papers if p.abstract and len(p.abstract) >= config.min_abstract_length]
+        # Filter by abstract length (allow short abstracts if title is informative)
+        papers = [
+            p for p in papers
+            if p.abstract and (
+                len(p.abstract) >= config.min_abstract_length
+                or (len(p.abstract) >= 40 and len(p.title or "") > 15)
+            )
+        ]
         
         if not papers:
             return []
@@ -1219,15 +1601,27 @@ Return JSON only:
     async def _enrich_with_full_text(self, papers: List[PaperObject]) -> List[PaperObject]:
         """Parse each available PDF with GROBID so CEGC can score full-paper text."""
         semaphore = asyncio.Semaphore(3)
+        total = len(papers)
+        parsed_count = 0
 
         async def parse_one(paper: PaperObject) -> PaperObject:
+            nonlocal parsed_count
             if not paper.pdf_url:
                 paper.full_text_source = "abstract_fallback"
                 return paper
             async with semaphore:
+                if self.progress:
+                    await self.progress.set_stage(
+                        "extracting_text",
+                        detail=f"Extracting text {parsed_count + 1}/{total}",
+                        progress=48 + int((parsed_count / max(total, 1)) * 10),
+                    )
                 parsed = await self.full_text_extractor.parse_pdf_url(paper)
+                parsed_count += 1
                 if not parsed:
                     paper.full_text_source = "abstract_fallback"
+                elif self.progress and parsed_count % 5 == 0:
+                    await self.progress.log_activity(f"Extracted text from {parsed_count}/{total} PDFs")
                 return paper
 
         return await asyncio.gather(*(parse_one(paper) for paper in papers))
@@ -1420,6 +1814,19 @@ Return JSON only:
             db_paper.citations_count = paper.citations_count
             db_paper.influence_score = paper.influence_score
             await self.db.flush()
+            if self.progress:
+                src = paper.source.value if hasattr(paper.source, "value") else str(paper.source)
+                self.progress.add_finalized_paper(
+                    title=paper.title,
+                    source=src,
+                    score=paper.final_score or 0.0,
+                    paper_id=str(db_paper.id),
+                )
+                await self.progress.set_stage(
+                    "storing_papers",
+                    detail=f"Stored {stored_count + 1} of {len(papers)} papers",
+                    progress=65 + int(((stored_count + 1) / max(len(papers), 1)) * 7),
+                )
             for attempt in range(2):
                 try:
                     await self.memory_system.record_paper_record(
@@ -1442,7 +1849,12 @@ Return JSON only:
         logger.info(f"Stored {stored_count} unique papers (with CEGC scores) for mission {mission_id}")
     
     async def _stage10_faiss_indexing(self, mission_id: str, papers: List[PaperObject]):
-        """STAGE 10: Create FAISS index for semantic search"""
+        """Async wrapper — delegates CPU work to thread pool."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._stage10_faiss_indexing_sync, mission_id, papers)
+
+    def _stage10_faiss_indexing_sync(self, mission_id: str, papers: List[PaperObject]):
+        """STAGE 10: Create FAISS index for semantic search (sync, runs in thread pool)."""
         if not faiss:
             logger.warning("FAISS not installed - skipping indexing")
             return

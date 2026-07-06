@@ -172,6 +172,7 @@ class ContradictionHandlingService:
             "context_resolved": 0,
             "ambiguous": 0,
             "no_candidates": 0,
+            "candidate_pairs_evaluated": 0,
             "instability_signal": False,
             "confirmed_ids": [],
         }
@@ -191,6 +192,7 @@ class ContradictionHandlingService:
                 continue
 
             for pair in pairs:
+                summary["candidate_pairs_evaluated"] += 1
                 if not await self._passes_direction_check(mission_id, pair, actor):
                     continue
                 context_result = await self._contextual_reconciliation(mission, pair, actor)
@@ -224,6 +226,37 @@ class ContradictionHandlingService:
                 previous_value=None,
                 new_value={"confirmed_count": summary["confirmed_contradictions"]},
             )
+
+        from app.services.pipeline_diagnostics import PipelineDiagnosticsService
+        diag = PipelineDiagnosticsService(self.db)
+        total_claims = (
+            await self.db.execute(
+                select(func.count(ResearchClaim.id)).where(ResearchClaim.mission_id == mission_id)
+            )
+        ).scalar_one()
+        graph_edges = (
+            await self.db.execute(
+                select(func.count(ClaimGraphEdge.id)).where(ClaimGraphEdge.mission_id == mission_id)
+            )
+        ).scalar_one()
+        claims_with_entities = (
+            await self.db.execute(
+                select(func.count(ResearchClaim.id)).where(
+                    ResearchClaim.mission_id == mission_id,
+                    ResearchClaim.intervention_canonical.isnot(None),
+                    ResearchClaim.outcome_canonical.isnot(None),
+                )
+            )
+        ).scalar_one()
+        summary["explanation"] = diag._explain_contradictions(
+            claims_evaluated=int(total_claims or 0),
+            confirmed=summary["confirmed_contradictions"],
+            context_resolved=summary["context_resolved"],
+            ambiguous=summary["ambiguous"],
+            no_candidate_events=summary["no_candidates"],
+            claims_with_entities=int(claims_with_entities or 0),
+            graph_edges=int(graph_edges or 0),
+        )
         return summary
 
     async def get_overview(self, mission_id: str) -> Dict[str, Any]:

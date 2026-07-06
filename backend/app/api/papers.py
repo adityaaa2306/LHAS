@@ -1,14 +1,24 @@
 """Paper Ingestion API Endpoints"""
 
+import json
 import logging
 import asyncio
+import time
 from datetime import datetime
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from app.database import get_db, async_session_maker
 from app.services.paper_ingestion import PaperIngestionService, IngestionConfig
+from app.services.ingestion_progress import (
+    INGESTION_STAGES,
+    default_background_tasks,
+    default_stats,
+    IngestionProgressTracker,
+    get_live_cache,
+    init_live_cache,
+)
 from app.models import ResearchPaper, IngestionEvent, Mission
 from app.config import settings
 from pydantic import BaseModel
@@ -17,6 +27,9 @@ import statistics
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
+
+# Track in-flight ingestion tasks — prevents duplicate scheduling on same process
+_active_ingestions: Set[str] = set()
 
 
 class IngestionConfigRequest(BaseModel):
@@ -27,7 +40,7 @@ class IngestionConfigRequest(BaseModel):
     relevance_threshold: float = 0.5
     sources: List[str] = ["arxiv", "semantic_scholar", "pubmed"]
     mmr_lambda: float = 0.8  # Increased from 0.6: prioritize relevance (80%) over diversity (20%)
-    min_abstract_length: int = 100
+    min_abstract_length: int = 50
 
 
 class StructuredQueryRequest(BaseModel):
@@ -41,7 +54,6 @@ class StructuredQueryRequest(BaseModel):
 
 @router.post("/ingest")
 async def ingest_papers(
-    background_tasks: BackgroundTasks,
     mission_id: str = Query(..., description="UUID of the mission"),
     structured_query: Optional[StructuredQueryRequest] = None,
     config: IngestionConfigRequest = IngestionConfigRequest(),
@@ -51,11 +63,10 @@ async def ingest_papers(
     Trigger paper ingestion for a mission (non-blocking background job).
 
     Returns immediately with {"status": "started"} and runs the full
-    11-stage pipeline in the background.  Poll GET /ingest/status/{mission_id}
+    pipeline in a dedicated asyncio task. Poll GET /ingest/status/{mission_id}
     to track progress.
     """
     try:
-        # Validate mission exists
         stmt = select(Mission).where(Mission.id == mission_id)
         result = await db.execute(stmt)
         mission = result.scalar_one_or_none()
@@ -63,11 +74,13 @@ async def ingest_papers(
         if not mission:
             raise HTTPException(status_code=404, detail=f"Mission {mission_id} not found")
 
-        # Prevent double-start if already running
-        if mission.ingestion_status == "processing":
+        # In-memory guard (same worker) + DB guard (cross-request)
+        if mission_id in _active_ingestions:
             return {"status": "already_running", "mission_id": mission_id}
 
-        # Build structured_query from mission if not provided
+        if mission.ingestion_status in ("processing", "pending"):
+            return {"status": "already_running", "mission_id": mission_id}
+
         if not structured_query:
             pico_dict = {}
             if mission.pico_population:
@@ -88,23 +101,42 @@ async def ingest_papers(
                 search_queries=[],
             )
 
-        # Mark as pending immediately (still within this request's session)
-        await db.execute(
+        # Atomic claim: only one caller can move idle/failed → pending
+        claim = await db.execute(
             update(Mission)
             .where(Mission.id == mission_id)
+            .where(Mission.ingestion_status.in_(["idle", "failed"]))
             .values(
                 ingestion_status="pending",
                 ingestion_progress=0,
                 ingestion_error=None,
                 ingestion_started_at=datetime.utcnow(),
                 ingestion_completed_at=None,
+                ingestion_current_stage="mission_created",
+                ingestion_stage_detail="Queued for processing",
+                ingestion_activity_log=json.dumps([{
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "message": "Ingestion queued",
+                    "level": "info",
+                }]),
+                ingestion_background_tasks=json.dumps(default_background_tasks()),
             )
+            .returning(Mission.id)
         )
+        claimed_id = claim.scalar_one_or_none()
+        if not claimed_id:
+            await db.rollback()
+            refreshed = await db.execute(select(Mission.ingestion_status).where(Mission.id == mission_id))
+            current = refreshed.scalar_one_or_none()
+            if current in ("processing", "pending"):
+                return {"status": "already_running", "mission_id": mission_id}
+            raise HTTPException(status_code=409, detail="Could not start ingestion — mission status conflict")
+
         await db.commit()
 
-        # Queue to run after response is sent — uses its own DB session
-        background_tasks.add_task(
-            _run_ingestion_background,
+        init_live_cache(mission_id)
+
+        _schedule_ingestion_background(
             mission_id,
             structured_query.dict(),
             config,
@@ -118,6 +150,29 @@ async def ingest_papers(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _schedule_ingestion_background(
+    mission_id: str,
+    structured_query_dict: Dict[str, Any],
+    config: IngestionConfigRequest,
+) -> None:
+    """Schedule ingestion on the event loop without blocking the HTTP response."""
+    if mission_id in _active_ingestions:
+        return
+    _active_ingestions.add(mission_id)
+
+    async def _wrapper() -> None:
+        try:
+            await _run_ingestion_background(mission_id, structured_query_dict, config)
+        finally:
+            _active_ingestions.discard(mission_id)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_wrapper())
+    except RuntimeError:
+        asyncio.run(_wrapper())
 
 
 async def _update_ingestion_status(
@@ -147,17 +202,26 @@ async def _run_ingestion_background(
 ) -> None:
     """
     Background task: runs the full ingestion pipeline with its own DB session.
-    Never throws — all exceptions are caught and written to ingestion_error.
+    Yields to the event loop between stages; never blocks status reads.
     """
+    progress = IngestionProgressTracker(mission_id)
     async with async_session_maker() as db:
         try:
-            await _update_ingestion_status(db, mission_id, "processing", progress=5)
+            await _update_ingestion_status(db, mission_id, "processing", progress=2)
+            await progress.set_stage(
+                "mission_created",
+                detail="Starting ingestion pipeline",
+                progress=2,
+                activity="Ingestion pipeline started",
+            )
+            await asyncio.sleep(0)  # yield to event loop
 
             structured_query = StructuredQueryRequest(**structured_query_dict)
             service = PaperIngestionService(
                 db,
                 semantic_scholar_api_key=settings.SEMANTIC_SCHOLAR_API_KEY,
                 pubmed_api_key=settings.PUBMED_API_KEY,
+                progress_tracker=progress,
             )
 
             await service.ingest_papers(
@@ -174,21 +238,29 @@ async def _run_ingestion_background(
                 ),
             )
 
-            # Check if any papers were actually stored
-            from sqlalchemy import func as sqlfunc
             paper_count_result = await db.execute(
-                select(sqlfunc.count()).select_from(ResearchPaper).where(ResearchPaper.mission_id == mission_id)
+                select(func.count()).select_from(ResearchPaper).where(ResearchPaper.mission_id == mission_id)
             )
             paper_count = paper_count_result.scalar() or 0
 
             if paper_count == 0:
+                await progress.set_stage("finalizing", detail="No papers stored", progress=100)
                 await _update_ingestion_status(
                     db, mission_id, "failed", progress=100,
                     error="All API sources returned 0 results (rate limits or no matching papers). Try again in a few minutes.",
                     completed=True,
                 )
+                await progress.log_activity("Ingestion failed — no papers found", level="error")
                 logger.warning("Background ingestion completed with 0 papers for mission %s", mission_id)
             else:
+                await progress.set_stage(
+                    "finalizing",
+                    detail=f"{paper_count} papers ingested",
+                    progress=100,
+                    activity=f"Ingestion complete — {paper_count} papers stored",
+                )
+                progress.mark_completed()
+                await progress.finalize()
                 await _update_ingestion_status(db, mission_id, "completed", progress=100, completed=True)
                 logger.info("Background ingestion completed (%d papers) for mission %s", paper_count, mission_id)
 
@@ -198,9 +270,12 @@ async def _run_ingestion_background(
             logger.error("Background ingestion FAILED for mission %s: %s", mission_id, err_msg)
             traceback.print_exc()
             try:
+                await progress.log_activity(f"Ingestion failed: {err_msg}", level="error")
+                progress.mark_completed(error=err_msg)
+                await progress.finalize()
                 await _update_ingestion_status(db, mission_id, "failed", error=err_msg, completed=True)
             except Exception:
-                pass  # DB might be gone — nothing we can do
+                pass
 
 
 @router.get("/ingest/status/{mission_id}")
@@ -208,28 +283,127 @@ async def get_ingestion_status(
     mission_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    """
-    Poll the current ingestion status for a mission.
+    """Poll ingestion progress — reads in-memory cache first (<5ms), then DB fallback."""
+    t0 = time.perf_counter()
 
-    Returns:
-        status: idle | pending | processing | completed | failed
-        progress: 0-100
-        error: error message if failed, else null
-    """
-    stmt = select(Mission).where(Mission.id == mission_id)
+    cached = get_live_cache(mission_id)
+    if cached:
+        payload = _build_status_payload(
+            mission_id,
+            status=cached.get("status", "processing"),
+            progress=cached.get("progress", 0),
+            error=cached.get("error"),
+            current_stage=cached.get("current_stage", "mission_created"),
+            stage_detail=cached.get("stage_detail"),
+            activities=cached.get("activities", []),
+            background_tasks=cached.get("background_tasks", default_background_tasks()),
+            stats=cached.get("stats", default_stats()),
+            started_at=cached.get("started_at"),
+            completed_at=cached.get("completed_at"),
+        )
+        total_ms = (time.perf_counter() - t0) * 1000
+        payload["_timing_ms"] = round(total_ms, 1)
+        payload["_source"] = "cache"
+        return payload
+
+    stmt = select(
+        Mission.ingestion_status,
+        Mission.ingestion_progress,
+        Mission.ingestion_error,
+        Mission.ingestion_started_at,
+        Mission.ingestion_completed_at,
+        Mission.ingestion_current_stage,
+        Mission.ingestion_stage_detail,
+        Mission.ingestion_activity_log,
+        Mission.ingestion_background_tasks,
+        Mission.ingestion_stats,
+    ).where(Mission.id == mission_id)
+
     result = await db.execute(stmt)
-    mission = result.scalar_one_or_none()
-
-    if not mission:
+    row = result.one_or_none()
+    if not row:
         raise HTTPException(status_code=404, detail=f"Mission {mission_id} not found")
+
+    activities: List[Dict[str, Any]] = []
+    if row.ingestion_activity_log:
+        try:
+            activities = json.loads(row.ingestion_activity_log)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    background_tasks = default_background_tasks()
+    if row.ingestion_background_tasks:
+        try:
+            background_tasks.update(json.loads(row.ingestion_background_tasks))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    stats = default_stats()
+    if row.ingestion_stats:
+        try:
+            stats.update(json.loads(row.ingestion_stats))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    payload = _build_status_payload(
+        mission_id,
+        status=row.ingestion_status or "idle",
+        progress=row.ingestion_progress or 0,
+        error=row.ingestion_error,
+        current_stage=row.ingestion_current_stage or "mission_created",
+        stage_detail=row.ingestion_stage_detail,
+        activities=activities,
+        background_tasks=background_tasks,
+        stats=stats,
+        started_at=row.ingestion_started_at.isoformat() if row.ingestion_started_at else None,
+        completed_at=row.ingestion_completed_at.isoformat() if row.ingestion_completed_at else None,
+    )
+    total_ms = (time.perf_counter() - t0) * 1000
+    payload["_timing_ms"] = round(total_ms, 1)
+    payload["_source"] = "db"
+    return payload
+
+
+def _build_status_payload(
+    mission_id: str,
+    *,
+    status: str,
+    progress: int,
+    error: Optional[str],
+    current_stage: str,
+    stage_detail: Optional[str],
+    activities: List[Dict[str, Any]],
+    background_tasks: Dict[str, Any],
+    stats: Dict[str, Any],
+    started_at: Optional[str],
+    completed_at: Optional[str],
+) -> Dict[str, Any]:
+    stage_index = next((i for i, s in enumerate(INGESTION_STAGES) if s["id"] == current_stage), 0)
+    stages_payload = []
+    for i, stage in enumerate(INGESTION_STAGES):
+        if i < stage_index:
+            st = "completed"
+        elif i == stage_index:
+            st = "completed" if status == "completed" else "running"
+        else:
+            st = "waiting"
+        if status == "failed" and i == stage_index:
+            st = "failed"
+        stages_payload.append({**stage, "status": st})
 
     return {
         "mission_id": mission_id,
-        "status": mission.ingestion_status or "idle",
-        "progress": mission.ingestion_progress or 0,
-        "error": mission.ingestion_error,
-        "started_at": mission.ingestion_started_at.isoformat() if mission.ingestion_started_at else None,
-        "completed_at": mission.ingestion_completed_at.isoformat() if mission.ingestion_completed_at else None,
+        "status": status,
+        "progress": progress,
+        "error": error,
+        "current_stage": current_stage,
+        "stage_detail": stage_detail,
+        "stages": stages_payload,
+        "activities": activities[-20:],
+        "background_tasks": background_tasks,
+        "stats": stats,
+        "started_at": started_at,
+        "completed_at": completed_at,
     }
 
 

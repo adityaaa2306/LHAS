@@ -72,6 +72,11 @@ class Mission(Base):
     ingestion_error = Column(Text, nullable=True)
     ingestion_started_at = Column(DateTime, nullable=True)
     ingestion_completed_at = Column(DateTime, nullable=True)
+    ingestion_current_stage = Column(String(64), nullable=True)
+    ingestion_stage_detail = Column(Text, nullable=True)
+    ingestion_activity_log = Column(Text, nullable=True)  # JSON array of recent activity entries
+    ingestion_background_tasks = Column(Text, nullable=True)  # JSON map of post-ingestion task status
+    ingestion_stats = Column(Text, nullable=True)  # JSON: counts, source breakdown, finalized papers
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

@@ -1067,10 +1067,32 @@ class ClaimExtractionService:
                 mission_question=mission_question,
                 pico_data=pico_data,
             )
-            
+
+            processing_audit = {
+                "paper_id": str(paper_record.paper_id),
+                "title": (paper_record.title or "")[:120],
+                "downloaded": bool(paper_record.pdf_url),
+                "parsed": bool(paper_record.full_text_content or paper_record.abstract),
+                "full_text_available": bool(paper_record.full_text_flag and paper_record.full_text_content),
+                "abstract_available": bool(paper_record.abstract and len(paper_record.abstract.strip()) >= 40),
+                "chunks_created": len(retrieved_chunks) if retrieved_chunks else 0,
+                "embeddings_generated": bool(
+                    retrieved_chunks
+                    and any(c.get("embedding") for c in retrieved_chunks)
+                ),
+                "claims_extracted": 0,
+                "entities_extracted": 0,
+                "graph_nodes_created": 0,
+            }
+
             if not retrieved_chunks:
                 logger.warning(f"No chunks retrieved for paper {paper_id}")
-                return {"success": False, "error": "No chunks retrieved"}
+                processing_audit["failure_reason"] = "No chunks retrieved from full text or abstract"
+                return {
+                    "success": False,
+                    "error": "No chunks retrieved",
+                    "processing_audit": processing_audit,
+                }
             
             logger.info(f"[RETRIEVAL] Retrieved {len(retrieved_chunks)} chunks")
             document_frame = self._build_document_frame(retrieved_chunks)
@@ -1307,7 +1329,11 @@ class ClaimExtractionService:
                     "success": True,
                     "claims": [],
                     "claims_extracted": 0,
-                    "message": "No curated high-quality findings met the persistence threshold"
+                    "message": "No curated high-quality findings met the persistence threshold",
+                    "processing_audit": {
+                        **processing_audit,
+                        "failure_reason": "Claims extracted but none met curation threshold",
+                    },
                 }
             
             # ===== PERSISTENCE =====
@@ -1431,12 +1457,35 @@ class ClaimExtractionService:
             })
             
             logger.info(f"[EXTRACTION] Complete: {len(persisted)} claims extracted and persisted")
-            
+
+            entities = set()
+            for c in persisted:
+                if c.get("intervention_canonical"):
+                    entities.add(c["intervention_canonical"])
+                if c.get("outcome_canonical"):
+                    entities.add(c["outcome_canonical"])
+            processing_audit["claims_extracted"] = len(persisted)
+            processing_audit["entities_extracted"] = len(entities)
+            processing_audit["graph_nodes_created"] = len(persisted)
+            processing_audit["entities"] = sorted(entities)[:10]
+
+            logger.info(
+                "[PAPER AUDIT] %s | downloaded=%s parsed=%s chunks=%s embeddings=%s claims=%s entities=%s",
+                processing_audit["paper_id"],
+                processing_audit["downloaded"],
+                processing_audit["parsed"],
+                processing_audit["chunks_created"],
+                processing_audit["embeddings_generated"],
+                processing_audit["claims_extracted"],
+                processing_audit["entities_extracted"],
+            )
+
             return {
                 "success": True,
                 "claims_extracted": len(persisted),
                 "claims": persisted,
-                "pipeline_status": "SUCCESS"
+                "pipeline_status": "SUCCESS",
+                "processing_audit": processing_audit,
             }
         
         except Exception as e:
